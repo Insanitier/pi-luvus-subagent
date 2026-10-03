@@ -341,11 +341,21 @@ function formatArgv(args: string[]): string {
  * directory and name are pinned here too, because the parent finds the child's
  * result by reading the only JSONL in the child's own session directory.
  */
-export function prepareLaunch(agent: AgentConfig, cwd: string, sessionName: string): LaunchPlan {
+export function prepareLaunch(
+	agent: AgentConfig,
+	cwd: string,
+	sessionName: string,
+	resumeFile?: string,
+): LaunchPlan {
 	// Pi names a session file `<timestamp>_<sessionId>.jsonl`, so pinning the id
 	// makes this child's file findable in the shared directory by suffix alone.
+	// Resuming skips all three flags: `--session <file>` reopens that conversation,
+	// and the id it already carries is the one this delegation keeps.
 	mkdirSync(SESSION_DIR, { recursive: true });
-	const args: string[] = ["--session-dir", SESSION_DIR, "--session-id", sessionName, "--name", sessionName];
+	const args: string[] =
+		resumeFile === undefined
+			? ["--session-dir", SESSION_DIR, "--session-id", sessionName, "--name", sessionName]
+			: ["--session", resumeFile];
 
 	// The child loads this same extension, which is what installs its reporter.
 	if (SELF_PATH !== undefined && existsSync(SELF_PATH)) args.push("--extension", SELF_PATH);
@@ -1192,6 +1202,12 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			agent: Type.String({ description: "Agent name, from the subagents listed in your context" }),
 			task: Type.String({ description: "Task to delegate" }),
+			resume: Type.Optional(
+				Type.String({
+					description:
+						"Session name of a delegation this session already ran, or a child session id, to continue that conversation. Transcripts are kept for 7 days; once swept, resume is unavailable and the earlier result is only in the transcript.",
+				}),
+			),
 			wait: Type.Optional(
 				Type.Boolean({
 					description: "Block until the subagent settles and return its result (default true)",
@@ -1214,8 +1230,34 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				};
 			}
 
-			const sessionName = `${agent.name}-${randomBytes(3).toString("hex")}`;
-			const plan = prepareLaunch(agent, ctx.cwd, sessionName);
+			// Resume names a delegation this session ran, or a child session id. Both are
+			// the id its transcript is filed under, so one lookup serves both.
+			let resumeFile: string | undefined;
+			if (params.resume !== undefined) {
+				const known = delegations.get(params.resume);
+				if (known !== undefined && known.state === "working") {
+					return {
+						content: [
+							{ type: "text", text: `${params.resume} is still running; steer it instead of resuming it.` },
+						],
+						isError: true,
+					};
+				}
+				resumeFile = sessionFileFor(params.resume);
+				if (resumeFile === undefined) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `No session to resume for "${params.resume}": its transcript is gone (kept for ${SESSION_RETENTION_DAYS} days). Its earlier result is still in the transcript.`,
+							},
+						],
+						isError: true,
+					};
+				}
+			}
+			const sessionName = params.resume ?? `${agent.name}-${randomBytes(3).toString("hex")}`;
+			const plan = prepareLaunch(agent, ctx.cwd, sessionName, resumeFile);
 			const { args, unresolvedSkills, promptFile } = plan;
 			const wait = params.wait ?? true;
 
@@ -1268,7 +1310,11 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					// Nothing awaits this: the delegation returns now, and the watcher
 					// reports the result once the child settles.
 					void deliverWhenSettled({ pi, pane, sessionId: sessionName, agentName: agent.name, promptFile, isStale: () => sessionStale });
-					const notice = [`Delegated to ${sessionName} in pane ${pane} (running).`, "It keeps running there; the pane is visible and steerable.", ...notes].join("\n");
+					const notice = [
+						`${resumeFile === undefined ? "Delegated to" : "Resumed"} ${sessionName} in pane ${pane} (running).`,
+						"It keeps running there; the pane is visible and steerable.",
+						...notes,
+					].join("\n");
 					return { content: [{ type: "text", text: notice }] };
 				}
 				if (outcome === "gone") notes.push(`its pane was closed before it finished; nothing is running in pane ${pane} any more`);

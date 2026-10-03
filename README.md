@@ -21,7 +21,7 @@ The agents that resolve are also listed in the parent's system prompt, rebuilt e
 
 | Tool | What it does |
 | --- | --- |
-| `delegate` | Start an agent in a Luvus pane. `wait: true` (the default) blocks until it settles and returns its answer; `wait: false` returns as soon as the pane is up and the answer arrives later as a completion message. `dry_run: true` prints the resolved launch plan without starting anything. |
+| `delegate` | Start an agent in a Luvus pane. `wait: true` (the default) blocks until it settles and returns its answer; `wait: false` returns as soon as the pane is up and the answer arrives later as a completion message. `resume` continues a conversation this session already ran, or one named by child session id. `dry_run: true` prints the resolved launch plan without starting anything. |
 | `steer` | Send another instruction to a running subagent. `interrupt: true` presses Esc first. |
 | `subagent_status` | List this session's delegations — name, state, duration, pane — or with `wait: true` block until one settles and return its answer. |
 
@@ -36,6 +36,8 @@ The child owns its pane, so a delegation is out-of-process by construction: `wai
 Completion notices are delivered as follow-ups, never steered mid-turn, so a notice cannot land between a tool call and its result.
 
 A pane that is closed ends its delegation at once. A wait cannot see a state that will never arrive, so the row settles as failed instead of counting down its window — a closed pane is not a slow child. A child that ended without a finished result is reported as such — `truncated`, `aborted`, `error`, `no answer` — with the provider's own words as the answer text. Pi reports no finer cause than `stopReason`, so no cause is guessed, and the note states what happened rather than what to do about it: partial output must not read as a finished result.
+
+A delegation's record lives in the session, not in the process: the registry is rebuilt from this session's own entries, so a reload or a restart keeps it while another session never sees it. Transcripts are kept for 7 days, which is what `resume` reopens; once swept, resume is unavailable and the earlier result is only in the transcript.
 
 Retrying a failed turn is deliberately not this extension's job. A retry engine belongs in an extension that hooks the session's own turn lifecycle, and one install then covers the parent and every child — children load the same configured extensions. See [pi-retry](https://github.com/monotykamary/pi-retry).
 

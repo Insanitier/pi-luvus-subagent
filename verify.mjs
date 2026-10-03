@@ -599,6 +599,54 @@ check(
 	),
 );
 
+console.log("\nresume");
+// A delegation this session ran can be continued: Pi's own `--session <file>` reopens
+// that conversation, and the id it already carries is the one this delegation keeps.
+const resumeList = (await tools.subagent_status.execute("verify-resume-list", {}, undefined, undefined, ctx)).content[0].text;
+const resumeSettled = resumeList.match(/(fixture-bare-[0-9a-f]{6})\s+(failed|done)/)?.[1];
+const resumeWorking = resumeList.match(/(fixture-bare-[0-9a-f]{6})\s+working/)?.[1];
+const resumed = await tools.delegate.execute(
+	"verify-resume",
+	{ agent: "fixture-bare", task: "continue where you left off", resume: resumeSettled, wait: false },
+	undefined,
+	undefined,
+	ctx,
+);
+check(
+	"resuming a delegation reopens its transcript",
+	resumed.content[0].text.startsWith(`Resumed ${resumeSettled} in pane`),
+	resumed.content[0].text,
+);
+check(
+	"the resumed child is launched on its own session file",
+	readFileSync(STUB_LOG, "utf-8").includes("-- --session /"),
+	readFileSync(STUB_LOG, "utf-8").trim().split("\n").at(-1),
+);
+const expired = await tools.delegate.execute(
+	"verify-expired",
+	{ agent: "fixture-bare", task: "x", resume: "no-such-session-zzzzzz" },
+	undefined,
+	undefined,
+	ctx,
+);
+check(
+	"an unknown session is refused, not silently started fresh",
+	expired.isError === true && expired.content[0].text.includes("No session to resume"),
+	expired.content[0].text,
+);
+const busy = await tools.delegate.execute(
+	"verify-busy",
+	{ agent: "fixture-bare", task: "x", resume: resumeWorking },
+	undefined,
+	undefined,
+	ctx,
+);
+check(
+	"a running delegation is steered, not resumed",
+	busy.isError === true && busy.content[0].text.includes("still running"),
+	busy.content[0].text,
+);
+
 console.log("\nsession boundary");
 // A switch keeps the process alive, so records from the session being left must not
 // answer this one's status tool: the reference clears at the same boundary.
