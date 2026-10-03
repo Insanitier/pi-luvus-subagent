@@ -825,15 +825,30 @@ async function teardownDelegation(watch: {
 /** Key the status line and the widget are published under. */
 const STATUS_KEY = "subagents";
 
-type Delegation = { startedAt: number; endedAt?: number; state: "working" | "done" | "failed"; pane: string };
+type Delegation = {
+	startedAt: number;
+	endedAt?: number;
+	state: "working" | "done" | "failed";
+	pane: string;
+	/** The parent turn it settled in: the widget's linger is counted in turns. */
+	settledTurn?: number;
+};
+
+/** A record outlives the widget, and only age retires it — the reference's 10 minutes. */
+const RECORD_RETENTION_MS = 10 * 60_000;
+/** How many parent turns the widget keeps a settled row, per the reference. */
+const DONE_LINGER_TURNS = 1;
+const ERROR_LINGER_TURNS = 2;
+/** The parent turn counter the linger is measured in. */
+let turn = 0;
 
 /**
  * One entry per delegation this session, keyed by session name — the only id the
  * tool and the detached watcher both hold.
  *
- * Settled entries stay only while something else is still running, so a finished
- * row can be read beside the one that is live. The moment nothing runs the whole
- * list goes (see renderStatus), and the completion card carries the result.
+ * Records outlive the widget, the way the reference separates them: a settled
+ * delegation stays queryable for ten minutes, while the widget draws it for a turn
+ * or two and not at all once nothing is running. Clearing the screen is not forgetting.
  */
 const delegations = new Map<string, Delegation>();
 let statusUi: ExtensionUIContext | undefined;
@@ -866,27 +881,36 @@ function renderStatus(): void {
 	// Nothing goes to the footer: the widget carries all of it, and a footer
 	// left by an earlier instance must not outlive this one.
 	ui.setStatus(STATUS_KEY, undefined);
+	// Records retire by age, never by the widget's absence.
+	for (const [name, entry] of delegations) {
+		if (entry.endedAt !== undefined && Date.now() - entry.endedAt > RECORD_RETENTION_MS) delegations.delete(name);
+	}
 	const all = [...delegations.entries()];
-	// pi-task's rule, which this widget copies: it exists only while a delegation is
-	// running. A finished row is kept only while it has a live neighbour to sit
-	// beside, because a settled list left above the editor reads as "still going"
-	// long after the work stopped — the completion card is what carries the result.
+	// The widget exists only while a delegation is running: a settled list left above
+	// the editor reads as "still going" long after the work stopped. What it has drawn
+	// is not forgotten — the status tool still answers from the records above.
 	const running = all.filter(([, entry]) => entry.state === "working").length;
 	if (running === 0) {
-		delegations.clear();
 		stopStatusTicker();
 		ui.setWidget(STATUS_KEY, undefined);
 		return;
 	}
+	// A settled row is drawn for a turn or two, the reference's linger, so a finished
+	// neighbour can be read beside the live one without becoming permanent furniture.
+	const drawn = all.filter(
+		([, entry]) =>
+			entry.state === "working" ||
+			turn - (entry.settledTurn ?? 0) <= (entry.state === "failed" ? ERROR_LINGER_TURNS : DONE_LINGER_TURNS),
+	);
 	const theme = ui.theme;
 	// Padded so the states and the durations line up across rows.
-	const nameWidth = Math.max(...all.map(([name]) => name.length));
-	const stateWidth = Math.max(...all.map(([, entry]) => entry.state.length));
-	const lines = [theme.fg(running > 0 ? "accent" : "dim", "Subagents")];
-	all.forEach(([name, entry], index) => {
+	const nameWidth = Math.max(...drawn.map(([name]) => name.length));
+	const stateWidth = Math.max(...drawn.map(([, entry]) => entry.state.length));
+	const lines = [theme.fg("accent", "Subagents")];
+	drawn.forEach(([name, entry], index) => {
 		const glyph = entry.state === "working" ? "◆" : entry.state === "done" ? "✓" : "✗";
 		const color = entry.state === "working" ? "accent" : entry.state === "done" ? "success" : "error";
-		const connector = theme.fg("dim", index === all.length - 1 ? "└─" : "├─");
+		const connector = theme.fg("dim", index === drawn.length - 1 ? "└─" : "├─");
 		lines.push(
 			`${connector} ${theme.fg(color, glyph)} ${theme.fg(color, name.padEnd(nameWidth))}  ${theme.fg(color, entry.state.padEnd(stateWidth))}  ${theme.fg("dim", formatElapsed(entry.startedAt, entry.endedAt))}`,
 		);
@@ -905,17 +929,15 @@ function renderStatus(): void {
 
 function trackDelegation(sessionName: string, pane: string, ui: ExtensionUIContext | undefined): void {
 	if (ui !== undefined) statusUi = ui;
-	// A new delegation starts the list over: the previous run is history.
-	for (const [name, entry] of delegations) {
-		if (entry.state !== "working") delegations.delete(name);
-	}
+	// Earlier records are not cleared here: they stay queryable until their age retires
+	// them, and the widget's own linger decides what is drawn.
 	delegations.set(sessionName, { startedAt: Date.now(), state: "working", pane });
 	renderStatus();
 }
 
 function settleDelegation(sessionName: string, state: "done" | "failed"): void {
 	const entry = delegations.get(sessionName);
-	if (entry !== undefined) delegations.set(sessionName, { ...entry, endedAt: Date.now(), state });
+	if (entry !== undefined) delegations.set(sessionName, { ...entry, endedAt: Date.now(), state, settledTurn: turn });
 	renderStatus();
 }
 
@@ -1052,6 +1074,8 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	 * stale list that would bake in at load time.
 	 */
 	pi.on("before_agent_start", (event) => {
+		// The parent turn the widget's linger is counted in.
+		turn++;
 		const agents = discoverAgents(event.systemPromptOptions.cwd);
 		if (agents.length === 0) {
 			delete event.systemPromptOptions.sections.subagent_agents;

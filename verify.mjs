@@ -481,6 +481,17 @@ check(
 	/fixture-bare-[0-9a-f]{6}\s+failed/.test(goneStatus.content[0].text),
 	goneStatus.content[0].text,
 );
+// Clearing the screen is not forgetting: records outlive the widget and the turns it
+// stopped drawing them, which is how the reference separates the two lifecycles.
+for (const handler of handlers.get("before_agent_start") ?? []) {
+	await handler({ systemPromptOptions: { cwd: HOME, sections: {} } }, ctx);
+}
+const later = await tools.subagent_status.execute("verify-later", {}, undefined, undefined, ctx);
+check(
+	"a settled delegation is still queryable after the widget let it go",
+	/fixture-bare-[0-9a-f]{6}\s+failed/.test(later.content[0].text),
+	later.content[0].text,
+);
 // A background delegation must not sit at "still running" once its pane is gone.
 const bgGone = await tools.delegate.execute("verify-bg-gone", { agent: "fixture-bare", task: "bg", wait: false }, undefined, undefined, ctx);
 check("a background delegation still returns immediately", bgGone.content[0].text.includes("(running)"), bgGone.content[0].text);
