@@ -35,6 +35,10 @@ The child owns its pane, so a delegation is out-of-process by construction: `wai
 
 Completion notices are delivered as follow-ups, never steered mid-turn, so a notice cannot land between a tool call and its result.
 
+A pane that is closed ends its delegation at once. A wait cannot see a state that will never arrive, so the row settles as failed instead of counting down its window — a closed pane is not a slow child. A child whose turn ended on an upstream error is reported that way, with its live pane named: a failed turn is not a dead session, and steering it continues the work.
+
+Retrying a failed turn is deliberately not this extension's job. A retry engine belongs in an extension that hooks the session's own turn lifecycle, and one install then covers the parent and every child — children load the same configured extensions. See [pi-retry](https://github.com/monotykamary/pi-retry).
+
 Child sessions live in `~/.pi/agent/subagent-sessions` and are swept after 7 days. A child is launched with `--subagent-child`, which loads this extension for state reporting only — handing the child the tools too would let subagents spawn subagents without bound.
 
 ## Verify

@@ -478,19 +478,49 @@ async function pressKey(pi: ExtensionAPI, sessionName: string, key: string): Pro
 	await callLuvus(pi, ["agent", "keys", sessionName, key], KEYSTROKE_TIMEOUT_MS);
 }
 
+/** A pane probe is one fast read; a Luvus that hangs must not stall a delegation. */
+const PANE_PROBE_TIMEOUT_MS = 10_000;
+
+/** How a wait ended. `gone` is not a timeout: no state will ever arrive for that pane. */
+type SettleOutcome = "settled" | "timeout" | "gone";
+
 /**
- * Whether the child reached `done`; a wait that timed out is an outcome, not a throw.
+ * Whether a delegation's pane still exists.
+ *
+ * Luvus answers a missing target with an error envelope and a non-zero exit, which
+ * `callLuvus` turns into a throw — so the envelope is read here. Only a definite
+ * `not_found` counts: a Luvus that cannot be reached has not said the pane is gone.
+ */
+async function paneIsGone(pi: ExtensionAPI, pane: string): Promise<boolean> {
+	const probe = await pi
+		.exec(luvusBinary(), ["agent", "get", pane], { timeout: PANE_PROBE_TIMEOUT_MS })
+		.catch(() => undefined);
+	if (probe === undefined || probe.killed) return false;
+	try {
+		const envelope = JSON.parse(probe.stdout.trim()) as { error?: { code?: string } };
+		return envelope.error?.code === "not_found";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * How a child ended: settled, still running, or its pane gone.
  *
  * `seconds` defaults to the window a blocking delegation uses; the status tool
- * passes its own, so asking about a child is never tied to that constant.
+ * passes its own, so asking about a child is never tied to that constant. Luvus
+ * reports a closed pane and an expired wait with the same exit code and no JSON,
+ * so a non-zero result asks the pane itself — a closed pane answers at once, and
+ * reading that as "still running" is what leaves a parent counting for nothing.
  */
-async function waitForSettle(pi: ExtensionAPI, pane: string, seconds = WAIT_SECONDS): Promise<boolean> {
+async function waitForSettle(pi: ExtensionAPI, pane: string, seconds = WAIT_SECONDS): Promise<SettleOutcome> {
 	const done = await callLuvus(
 		pi,
 		["wait", "agent-status", pane, "--status", "done", "--timeout", String(seconds)],
 		(seconds + 30) * 1000,
 	);
-	return done.code === 0;
+	if (done.code === 0) return "settled";
+	return (await paneIsGone(pi, pane)) ? "gone" : "timeout";
 }
 
 async function closePane(pi: ExtensionAPI, pane: string): Promise<void> {
@@ -668,23 +698,34 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 	const { pi, pane, sessionId, agentName, promptFile, isStale } = watch;
 	// The registry owns the start time, so the notice and the widget agree.
 	const startedAt = delegations.get(sessionId)?.startedAt ?? Date.now();
-	let settled = false;
+	let outcome: SettleOutcome = "timeout";
 	try {
-		settled = await waitForSettle(pi, pane);
+		outcome = await waitForSettle(pi, pane);
 		const result = readChildResult(sessionId);
-		settleDelegation(sessionId, result?.status === "failed" ? "failed" : "done");
+		// A closed pane is a delegation that ended without finishing; a wait that ran out
+		// leaves a child that is still working, which is not a failure.
+		settleDelegation(sessionId, outcome === "gone" || result?.status === "failed" ? "failed" : "done");
 		if (isStale()) return;
 
 		const elapsed = `${Math.round((Date.now() - startedAt) / 1000)}s`;
-		const header = settled
-			? `${result?.status === "failed" ? "✗" : "✓"} ${agentName} (${elapsed}, ${sessionId})`
-			: `⌛ ${agentName} (still running after ${WAIT_SECONDS}s, ${sessionId})`;
+		const header =
+			outcome === "gone"
+				? `✗ ${agentName} (${elapsed}, ${sessionId}) — its pane was closed before it finished`
+				: outcome === "settled"
+					? `${result?.status === "failed" ? "✗" : "✓"} ${agentName} (${elapsed}, ${sessionId})`
+					: `⌛ ${agentName} (still running after ${WAIT_SECONDS}s, ${sessionId})`;
+		// A turn that ended on an upstream error is not a dead child: the session is still
+		// there, so say so instead of leaving the parent to delegate again.
+		const body = [header, "", capCompletion(result === undefined ? "(no result was written)" : result.text)];
+		if (outcome === "settled" && result?.status === "failed") {
+			body.push("", `Its pane is still alive (pane ${pane}) — steer it to continue, or delegate again.`);
+		}
 		pi.sendMessage(
 			{
 				customType: "luvus-subagent-completion",
 				// The answer rides along, capped; the renderer draws it as a card so the
 				// transcript stays readable without hiding the result from the parent.
-				content: [header, "", capCompletion(result === undefined ? "(no result was written)" : result.text)].join("\n"),
+				content: body.join("\n"),
 				details: { sessionId, pane, status: result?.status },
 				display: true,
 			},
@@ -703,7 +744,7 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 			{ deliverAs: "followUp", triggerTurn: true },
 		);
 	} finally {
-		await teardownDelegation({ pi, pane, promptFile, settled });
+		await teardownDelegation({ pi, pane, promptFile, settled: outcome === "settled" });
 	}
 }
 
@@ -890,16 +931,17 @@ async function submitUntilTaken(pi: ExtensionAPI, sessionName: string, task: str
 /** The blocking path's tool result: the child's answer, capped, plus any notes. */
 function blockingResult(
 	agentName: string,
-	settled: boolean,
+	outcome: SettleOutcome | undefined,
 	result: ChildResult | undefined,
 	notes: string[],
 ): { content: { type: "text"; text: string }[]; isError: boolean } {
+	const state = outcome === "gone" ? "pane closed" : outcome === "settled" ? "done" : "still running";
 	return {
 		content: [
 			{
 				type: "text",
 				text: [
-					`${agentName} (${settled ? "done" : "still running"}):`,
+					`${agentName} (${state}):`,
 					"",
 					// Both surfaces protect the parent's context with the same limit.
 					capCompletion(result === undefined ? "(no result was written)" : result.text),
@@ -907,7 +949,7 @@ function blockingResult(
 				].join("\n"),
 			},
 		],
-		isError: result?.status === "failed",
+		isError: outcome === "gone" || result?.status === "failed",
 	};
 }
 
@@ -1047,6 +1089,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			// pane either way, so it stays visible and steerable throughout. `settled`
 			// also means the pane is finished, which is what the teardown looks at.
 			let settled = false;
+			let outcome: SettleOutcome | undefined;
 			try {
 				// 2. Hand the task over, then confirm the child took it.
 				const picked = await submitUntilTaken(pi, sessionName, params.task);
@@ -1057,7 +1100,10 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					const unpicked = `${sessionName} never picked the task up: its pane stayed idle after ${SUBMIT_ATTEMPTS} Enter attempts. Nothing was started.`;
 					return { content: [{ type: "text", text: unpicked }], isError: true };
 				}
-				if (wait) settled = await waitForSettle(pi, pane);
+				if (wait) {
+					outcome = await waitForSettle(pi, pane);
+					settled = outcome === "settled";
+				}
 				const notes: string[] = [];
 				if (unresolvedSkills.length > 0) notes.push(`unresolved skills: ${unresolvedSkills.join(", ")}`);
 				if (!wait) {
@@ -1067,11 +1113,19 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					const notice = [`Delegated to ${sessionName} in pane ${pane} (running).`, "It keeps running there; the pane is visible and steerable.", ...notes].join("\n");
 					return { content: [{ type: "text", text: notice }] };
 				}
-				if (!settled) notes.push(`did not settle within ${WAIT_SECONDS}s; it is still running in pane ${pane}`);
+				if (outcome === "gone") notes.push(`its pane was closed before it finished; nothing is running in pane ${pane} any more`);
+				else if (!settled) notes.push(`did not settle within ${WAIT_SECONDS}s; it is still running in pane ${pane}`);
 				const result = readChildResult(sessionName);
+				// A turn that ended on an upstream error is not a dead child: its pane is still
+				// there, so tell the parent it can be steered instead of delegating again.
+				if (settled && result?.status === "failed") {
+					notes.push(`its last turn ended with an upstream error; the pane is still alive (pane ${pane}) — steer it to continue, or delegate again`);
+				}
 				// A child that outlived the wait is still working, and stays that way here.
-				if (settled) settleDelegation(sessionName, result?.status === "failed" ? "failed" : "done");
-				return blockingResult(agent.name, settled, result, notes);
+				if (settled || outcome === "gone") {
+					settleDelegation(sessionName, settled && result?.status !== "failed" ? "done" : "failed");
+				}
+				return blockingResult(agent.name, outcome, result, notes);
 			} finally {
 				// 3. The blocking delegation is over; do not leave its pane — or the
 				//    prompt file, which the child read during startup — behind.
@@ -1176,9 +1230,14 @@ pi.registerTool({
 		// settle must land in the registry — otherwise the tool blocks, then reports
 		// `working`, contradicting itself.
 		const only = rows.length === 1 ? rows[0] : undefined;
+		let waitedGone = false;
 		if (params.wait === true && only !== undefined && only[1].state === "working") {
 			const seconds = Math.max(1, Math.ceil((params.timeout_ms ?? WAIT_SECONDS * 1000) / 1000));
-			if (await waitForSettle(pi, only[1].pane, seconds)) {
+			const outcome = await waitForSettle(pi, only[1].pane, seconds);
+			if (outcome === "gone") {
+				waitedGone = true;
+				settleDelegation(only[0], "failed");
+			} else if (outcome === "settled") {
 				const settled = readChildResult(only[0]);
 				settleDelegation(only[0], settled?.status === "failed" ? "failed" : "done");
 			}
@@ -1189,6 +1248,10 @@ pi.registerTool({
 		// text — its last terminal turn can predate a steer, so it must not decide state.
 		// Re-read the registry: the wait above may have settled a row, and rendering the
 		// pre-wait snapshot would report `working` right after blocking on it.
+		// A wait that found the pane gone leaves a reason behind: `failed` alone would
+		// not say whether anything is still running.
+		const notes: string[] = [];
+		if (waitedGone) notes.push(`pane ${only?.[1].pane ?? ""} is gone: the delegation ended when its pane was closed`);
 		const current = [...delegations.entries()].filter(
 			([name]) => params.sessionName === undefined || name === params.sessionName,
 		);
@@ -1202,6 +1265,7 @@ pi.registerTool({
 					type: "text",
 					text: [
 						lines.join("\n"),
+						...(notes.length > 0 ? ["", ...notes] : []),
 						...(answer === undefined
 							? []
 							: ["", `answer from ${params.sessionName}:`, "", capCompletion(answer.text)]),

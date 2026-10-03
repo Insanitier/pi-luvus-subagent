@@ -111,14 +111,25 @@ if (argv[0] === "agent" && argv[1] === "prompt") {
 	if (argv[3] !== "NEVER_PICKED") {
 		mkdirSync(sessionDir, { recursive: true });
 		const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
+		const terminal = argv[3] === "ERRORED_TASK"
+			? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
+			: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
 		writeFileSync(file, [
 			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: argv[3] }] } }),
-			JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] } }),
+			JSON.stringify({ type: "message", message: terminal }),
 		].join("\\n"));
 	}
 	ok({});
 }
-if (argv[0] === "wait") process.exit(process.env.LUVUS_STUB_UNSETTLED === "1" ? 1 : 0);
+if (argv[0] === "wait") process.exit(process.env.LUVUS_STUB_GONE === "1" ? 2 : process.env.LUVUS_STUB_UNSETTLED === "1" ? 1 : 0);
+if (argv[0] === "agent" && argv[1] === "get") {
+	// A pane that is gone answers with the envelope Luvus uses, and a non-zero exit.
+	if (process.env.LUVUS_STUB_GONE === "1") {
+		process.stdout.write(JSON.stringify({ error: { code: "not_found", message: "agent target not found" } }));
+		process.exit(1);
+	}
+	ok({ pane: argv[2], status: "working" });
+}
 if (argv[0] === "agent" && argv[1] === "report") ok({});
 if (argv[0] === "agent" && argv[1] === "release") ok({});
 if (argv[0] === "agent" && argv[1] === "keys") ok({});
@@ -305,7 +316,10 @@ check(
 );
 check(
 	"an unsettled child keeps its pane",
-	readFileSync(STUB_LOG, "utf-8").trim().split("\n").at(-1)?.startsWith("wait agent-status") === true,
+	// The probe that ends a wait also logs, so this asks what the delegation did instead
+	// of what it logged last: it waited, and it never closed the pane afterwards.
+	readFileSync(STUB_LOG, "utf-8").trim().split("\n").findLastIndex((line) => line.startsWith("wait agent-status")) >
+		readFileSync(STUB_LOG, "utf-8").trim().split("\n").findLastIndex((line) => line.startsWith("pane close")),
 	readFileSync(STUB_LOG, "utf-8").trim().split("\n").at(-1),
 );
 process.env.LUVUS_STUB_UNSETTLED = "";
@@ -442,6 +456,46 @@ check("status can wait for a named delegation", /done/.test(waited.content[0].te
 check(
 	"the wait went through the extension, not a bash tool",
 	readFileSync(STUB_LOG, "utf-8").includes("wait agent-status 42"),
+);
+
+console.log("\ngone pane and transient errors");
+// A closed pane is not a timeout: nothing will ever report for it, so the delegation
+// has to end now instead of counting down the whole window.
+process.env.LUVUS_STUB_GONE = "1";
+const gone = await tools.delegate.execute("verify-gone", { agent: "fixture-bare", task: "go away" }, undefined, undefined, ctx);
+check(
+	"a closed pane ends the delegation instead of counting down",
+	gone.isError === true &&
+		gone.content[0].text.startsWith("fixture-bare (pane closed):") &&
+		gone.content[0].text.includes("was closed before it finished"),
+	gone.content[0].text,
+);
+check("a closed pane is never called still running", !gone.content[0].text.includes("still running"), gone.content[0].text);
+const goneStatus = await tools.subagent_status.execute("verify-gone-status", {}, undefined, undefined, ctx);
+check(
+	"status reports the closed delegation as failed",
+	/fixture-bare-[0-9a-f]{6}\s+failed/.test(goneStatus.content[0].text),
+	goneStatus.content[0].text,
+);
+// A background delegation must not sit at "still running" once its pane is gone.
+const bgGone = await tools.delegate.execute("verify-bg-gone", { agent: "fixture-bare", task: "bg", wait: false }, undefined, undefined, ctx);
+check("a background delegation still returns immediately", bgGone.content[0].text.includes("(running)"), bgGone.content[0].text);
+await new Promise((resolve) => setTimeout(resolve, 1500));
+check(
+	"the detached watcher reports a closed pane instead of still running",
+	notices.some((notice) => String(notice.content).includes("its pane was closed before it finished")),
+	JSON.stringify(notices.map((notice) => notice.content)),
+);
+process.env.LUVUS_STUB_GONE = "";
+// A turn that ended on an upstream error leaves a live session behind: the parent has
+// to be told it can steer instead of delegating again.
+const errored = await tools.delegate.execute("verify-errored", { agent: "fixture-bare", task: "ERRORED_TASK" }, undefined, undefined, ctx);
+check(
+	"an upstream error is reported with a live pane, not as a dead child",
+	errored.content[0].text.startsWith("fixture-bare (done):") &&
+		errored.content[0].text.includes("upstream error") &&
+		errored.content[0].text.includes("pane is still alive"),
+	errored.content[0].text,
 );
 
 console.log("\nplan and steer");
