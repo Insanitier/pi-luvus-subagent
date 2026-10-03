@@ -537,7 +537,52 @@ async function closePane(pi: ExtensionAPI, pane: string): Promise<void> {
 /** Stop reasons that mean the assistant message is final rather than intermediate. */
 const TERMINAL_STOP_REASONS = new Set(["stop", "endTurn", "length", "error", "aborted"]);
 
-type ChildResult = { status: "completed" | "failed"; text: string };
+/**
+ * How a child's last turn ended, as a closed set.
+ *
+ * Pi reports no finer cause than `stopReason`, and the provider's own words ride along
+ * in `errorMessage` — so this never guesses at one. `no-answer` and `pane closed` are
+ * not turn outcomes but delegation ones: the first is a child that settled without
+ * writing anything, the second a pane that stopped existing.
+ */
+type ChildOutcome = "done" | "truncated" | "aborted" | "error" | "no-answer" | "pane closed" | "still running";
+
+type ChildResult = { status: "completed" | "failed"; text: string; outcome: ChildOutcome };
+
+/**
+ * The word and the parenthetical note for one outcome.
+ *
+ * The note states what happened, never what to do about it: naming an action raises
+ * its salience, which is how a parent that reads partial output as a finished result
+ * ends up delegating the same work twice. Same shape as `pi-subagents`.
+ */
+function outcomeLine(outcome: ChildOutcome): { word: string; note: string } {
+	switch (outcome) {
+		case "truncated":
+			return { word: "truncated", note: "(hit the output limit before finishing — the answer may be truncated)" };
+		case "aborted":
+			return {
+				word: "aborted",
+				note: "(aborted before it finished — the answer may be incomplete; its pane is still there)",
+			};
+		case "error":
+			return {
+				word: "error",
+				note: "(its last turn ended as error — the task did not finish; its pane is still there)",
+			};
+		case "no-answer":
+			return {
+				word: "no answer",
+				note: "(it settled without writing an answer — there is no result to read; its pane is still there)",
+			};
+		case "pane closed":
+			return { word: "pane closed", note: "(its pane was closed before it finished)" };
+		case "still running":
+			return { word: "still running", note: "" };
+		default:
+			return { word: "done", note: "" };
+	}
+}
 /**
  * The file Pi wrote for one child session, or undefined when there is none.
  *
@@ -595,10 +640,15 @@ function readChildResult(sessionId: string): ChildResult | undefined {
 	if (terminal.stopReason === "error" || terminal.stopReason === "aborted") {
 		return {
 			status: "failed",
+			outcome: terminal.stopReason === "aborted" ? "aborted" : "error",
 			text: terminal.errorMessage?.trim() || terminal.text.trim() || `Subagent ${terminal.stopReason} before producing a result.`,
 		};
 	}
-	return { status: "completed", text: terminal.text.trim() || "(no output)" };
+	return {
+		status: "completed",
+		outcome: terminal.stopReason === "length" ? "truncated" : "done",
+		text: terminal.text.trim() || "(no output)",
+	};
 }
 
 /**
@@ -708,18 +758,16 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 		if (isStale()) return;
 
 		const elapsed = `${Math.round((Date.now() - startedAt) / 1000)}s`;
+		// The notice carries the same single dimension as the tool result.
+		const ended =
+			outcome === "gone" ? "pane closed" : outcome === "settled" ? (result?.outcome ?? "no-answer") : "still running";
+		const line = outcomeLine(ended);
 		const header =
-			outcome === "gone"
-				? `✗ ${agentName} (${elapsed}, ${sessionId}) — its pane was closed before it finished`
-				: outcome === "settled"
-					? `${result?.status === "failed" ? "✗" : "✓"} ${agentName} (${elapsed}, ${sessionId})`
-					: `⌛ ${agentName} (still running after ${WAIT_SECONDS}s, ${sessionId})`;
-		// A turn that ended on an upstream error is not a dead child: the session is still
-		// there, so say so instead of leaving the parent to delegate again.
+			ended === "still running"
+				? `⌛ ${agentName} (still running after ${WAIT_SECONDS}s, ${sessionId})`
+				: `${ended === "done" ? "✓" : "✗"} ${agentName} (${line.word}, ${elapsed}, ${sessionId})`;
 		const body = [header, "", capCompletion(result === undefined ? "(no result was written)" : result.text)];
-		if (outcome === "settled" && result?.status === "failed") {
-			body.push("", `Its pane is still alive (pane ${pane}) — steer it to continue, or delegate again.`);
-		}
+		if (line.note.length > 0) body.push("", line.note);
 		pi.sendMessage(
 			{
 				customType: "luvus-subagent-completion",
@@ -935,21 +983,28 @@ function blockingResult(
 	result: ChildResult | undefined,
 	notes: string[],
 ): { content: { type: "text"; text: string }[]; isError: boolean } {
-	const state = outcome === "gone" ? "pane closed" : outcome === "settled" ? "done" : "still running";
+	// One dimension, like the reference: how the delegation ended. The wait decides when
+	// the child produced no result at all, the child's own last turn decides otherwise,
+	// and a turn that landed no answer is its own state rather than `done`.
+	const ended =
+		outcome === "gone" ? "pane closed" : outcome === "settled" ? (result?.outcome ?? "no-answer") : "still running";
+	const line = outcomeLine(ended);
+	const body = [...notes];
+	if (line.note.length > 0) body.push(line.note);
 	return {
 		content: [
 			{
 				type: "text",
 				text: [
-					`${agentName} (${state}):`,
+					`${agentName} (${line.word}):`,
 					"",
 					// Both surfaces protect the parent's context with the same limit.
 					capCompletion(result === undefined ? "(no result was written)" : result.text),
-					...(notes.length > 0 ? ["", ...notes] : []),
+					...(body.length > 0 ? ["", ...body] : []),
 				].join("\n"),
 			},
 		],
-		isError: outcome === "gone" || result?.status === "failed",
+		isError: ended === "pane closed" || result?.status === "failed",
 	};
 }
 
@@ -1116,11 +1171,6 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				if (outcome === "gone") notes.push(`its pane was closed before it finished; nothing is running in pane ${pane} any more`);
 				else if (!settled) notes.push(`did not settle within ${WAIT_SECONDS}s; it is still running in pane ${pane}`);
 				const result = readChildResult(sessionName);
-				// A turn that ended on an upstream error is not a dead child: its pane is still
-				// there, so tell the parent it can be steered instead of delegating again.
-				if (settled && result?.status === "failed") {
-					notes.push(`its last turn ended with an upstream error; the pane is still alive (pane ${pane}) — steer it to continue, or delegate again`);
-				}
 				// A child that outlived the wait is still working, and stays that way here.
 				if (settled || outcome === "gone") {
 					settleDelegation(sessionName, settled && result?.status !== "failed" ? "done" : "failed");

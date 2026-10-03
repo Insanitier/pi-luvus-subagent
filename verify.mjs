@@ -113,10 +113,12 @@ if (argv[0] === "agent" && argv[1] === "prompt") {
 		const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
 		const terminal = argv[3] === "ERRORED_TASK"
 			? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
-			: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
+			: argv[3] === "NO_ANSWER_TASK"
+				? undefined
+				: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
 		writeFileSync(file, [
 			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: argv[3] }] } }),
-			JSON.stringify({ type: "message", message: terminal }),
+			...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
 		].join("\\n"));
 	}
 	ok({});
@@ -491,11 +493,19 @@ process.env.LUVUS_STUB_GONE = "";
 // to be told it can steer instead of delegating again.
 const errored = await tools.delegate.execute("verify-errored", { agent: "fixture-bare", task: "ERRORED_TASK" }, undefined, undefined, ctx);
 check(
-	"an upstream error is reported with a live pane, not as a dead child",
-	errored.content[0].text.startsWith("fixture-bare (done):") &&
-		errored.content[0].text.includes("upstream error") &&
-		errored.content[0].text.includes("pane is still alive"),
+	"a failed turn is its own state, with the provider's own words",
+	errored.content[0].text.startsWith("fixture-bare (error):") &&
+		errored.content[0].text.includes("upstream: connection reset") &&
+		errored.content[0].text.includes("the task did not finish"),
 	errored.content[0].text,
+);
+// Settling without writing anything is not a finished task: it is its own state.
+const noAnswer = await tools.delegate.execute("verify-no-answer", { agent: "fixture-bare", task: "NO_ANSWER_TASK" }, undefined, undefined, ctx);
+check(
+	"a child that settled without an answer says so",
+	noAnswer.content[0].text.startsWith("fixture-bare (no answer):") &&
+		noAnswer.content[0].text.includes("there is no result to read"),
+	noAnswer.content[0].text,
 );
 
 console.log("\nplan and steer");

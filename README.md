@@ -35,7 +35,7 @@ The child owns its pane, so a delegation is out-of-process by construction: `wai
 
 Completion notices are delivered as follow-ups, never steered mid-turn, so a notice cannot land between a tool call and its result.
 
-A pane that is closed ends its delegation at once. A wait cannot see a state that will never arrive, so the row settles as failed instead of counting down its window — a closed pane is not a slow child. A child whose turn ended on an upstream error is reported that way, with its live pane named: a failed turn is not a dead session, and steering it continues the work.
+A pane that is closed ends its delegation at once. A wait cannot see a state that will never arrive, so the row settles as failed instead of counting down its window — a closed pane is not a slow child. A child that ended without a finished result is reported as such — `truncated`, `aborted`, `error`, `no answer` — with the provider's own words as the answer text. Pi reports no finer cause than `stopReason`, so no cause is guessed, and the note states what happened rather than what to do about it: partial output must not read as a finished result.
 
 Retrying a failed turn is deliberately not this extension's job. A retry engine belongs in an extension that hooks the session's own turn lifecycle, and one install then covers the parent and every child — children load the same configured extensions. See [pi-retry](https://github.com/monotykamary/pi-retry).
 
