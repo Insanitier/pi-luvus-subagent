@@ -15,7 +15,7 @@ Subagents are declared once in Markdown, and their frontmatter becomes the child
 - `~/.pi/agent/agents/*.md` — user agents
 - `<project>/.pi/agents/*.md` — project agents, which win on a name clash
 
-`/subagent-agents` prints every agent that resolves and the `pi` argv it launches with.
+The agents that resolve are also listed in the parent's system prompt, rebuilt each turn, so the model delegates to real names instead of guessing them. `/subagent-agents` prints the same set for a human, plus the `pi` argv each one launches with.
 
 ## Tools
 

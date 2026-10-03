@@ -940,6 +940,26 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		delegations.clear();
 		stopStatusTicker();
 	});
+
+	/**
+	 * The parent can only delegate to an agent it knows about, so the catalogue is
+	 * rebuilt every turn and dropped into its own system-prompt section. Same
+	 * content the reference extensions inline into a tool definition, minus the
+	 * stale list that would bake in at load time.
+	 */
+	pi.on("before_agent_start", (event) => {
+		const agents = discoverAgents(event.systemPromptOptions.cwd);
+		if (agents.length === 0) {
+			delete event.systemPromptOptions.sections.subagent_agents;
+			return;
+		}
+		event.systemPromptOptions.sections.subagent_agents = [
+			"delegate can launch these subagents, declared in .pi/agents/*.md:",
+			...agents.map((agent) =>
+				agent.description.length > 0 ? `- ${agent.name}: ${agent.description}` : `- ${agent.name}`,
+			),
+		].join("\n");
+	});
 	/** Dev aid: show what each agent resolves to before any pane is opened. */
 	pi.registerCommand("subagent-agents", {
 		description: "List subagent definitions and the Pi argv each one launches with",
@@ -965,10 +985,19 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		name: "delegate",
 		label: "Subagent",
 		description:
-			"Delegate a task to an agent running in a visible Luvus pane. Use dry_run to inspect the resolved launch plan without starting anything.",
+			"Delegate a task to a subagent running in a visible Luvus pane. wait: false returns as soon as the pane is up and the answer arrives later as a completion message; ask for it sooner with subagent_status. Use dry_run to inspect the resolved launch plan without starting anything.",
 		promptSnippet: "Delegate a task to a subagent running in a visible Luvus pane",
+		// The delegation policy, tuned from the subagents fork: when to reach for an
+		// agent, when to search directly instead, and what the answer means.
+		promptGuidelines: [
+			"When to delegate — reach for this when the task matches an available subagent, when you have independent work to run in parallel, or when answering would mean reading across several files. Delegate it and you keep the conclusion, not the file dumps.",
+			"For a single-fact lookup where you already know the file, symbol, or value, search directly. Once you have delegated an investigation, do NOT also run it yourself — wait for the result.",
+			"Provide clear, detailed prompts so the subagent can work autonomously.",
+			"A subagent's answer comes back as text and is also shown to the user — relay what matters instead of repeating it.",
+			"Never fabricate or predict a pending subagent's result. If the user asks before it arrives, say it is still running.",
+		],
 		parameters: Type.Object({
-			agent: Type.String({ description: "Agent name from .pi/agents/*.md" }),
+			agent: Type.String({ description: "Agent name, from the subagents listed in your context" }),
 			task: Type.String({ description: "Task to delegate" }),
 			wait: Type.Optional(
 				Type.Boolean({
@@ -1070,8 +1099,11 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		name: "steer",
 		label: "Steer subagent",
 		description:
-			"Send an additional instruction to a subagent that is already running in its Luvus pane. Set interrupt to stop its current work first.",
+			"Send an additional instruction to a subagent that is already running in its Luvus pane. Set interrupt to stop its current work first; a background delegation keeps its pane open for this.",
 		promptSnippet: "Send an additional instruction to a running subagent",
+		promptGuidelines: [
+			"Use steer to redirect a running subagent mid-run instead of waiting for it to finish and delegating the correction again.",
+		],
 		parameters: Type.Object({
 			sessionName: Type.String({ description: "Subagent session name, as returned by delegate" }),
 			message: Type.String({ description: "Instruction to send" }),
@@ -1109,6 +1141,9 @@ pi.registerTool({
 	description:
 		"List this session's subagent delegations and their state. With wait: true, block until the named delegation settles (or timeout_ms passes) and return its answer.",
 	promptSnippet: "Check on subagents this session delegated",
+	promptGuidelines: [
+		"A background delegation's answer arrives on its own; ask for it with subagent_status only when you need it sooner.",
+	],
 	parameters: Type.Object({
 		sessionName: Type.Optional(
 			Type.String({

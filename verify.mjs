@@ -481,6 +481,43 @@ check("no prompt file is left by any path", left.length === 0, left.join(", "));
 
 // The reporter is the child-side half of this extension: it runs only when Luvus
 // hands the process a pane. Drive it through the real event handlers.
+console.log("\ndelegation prompt");
+// The parent can only delegate to agents it is told about, so the catalogue is
+// rebuilt every turn into its own system-prompt section. The shared `fire` helper
+// passes an empty event, and this handler reads the prompt options, so drive it
+// with a real event here.
+const sections = { subagent_agents: "stale" };
+const promptEvent = { systemPromptOptions: { cwd: HOME, sections } };
+for (const handler of handlers.get("before_agent_start") ?? []) await handler(promptEvent, ctx);
+check(
+	"the agent catalogue is written into the system prompt",
+	typeof sections.subagent_agents === "string" &&
+		sections.subagent_agents.includes("- fixture-bare: Minimal agent, no tools key.") &&
+		sections.subagent_agents.includes("- fixture-full:"),
+	sections.subagent_agents,
+);
+check("a stale catalogue is replaced, not added to", !sections.subagent_agents.includes("stale"), sections.subagent_agents);
+check(
+	"delegate carries the delegation policy",
+	(tools.delegate.promptGuidelines ?? []).some((rule) => rule.includes("When to delegate")),
+	JSON.stringify(tools.delegate.promptGuidelines),
+);
+check(
+	"delegate points at subagent_status for an answer that has not arrived",
+	tools.delegate.description.includes("subagent_status"),
+	tools.delegate.description,
+);
+check(
+	"steer and subagent_status each carry their own rule",
+	(tools.steer.promptGuidelines ?? []).length === 1 && (tools.subagent_status.promptGuidelines ?? []).length === 1,
+);
+check(
+	"guidelines are bare rules: the renderer adds the dash",
+	["delegate", "steer", "subagent_status"].every((name) =>
+		(tools[name].promptGuidelines ?? []).every((rule) => !rule.startsWith("- ")),
+	),
+);
+
 console.log("\nchild state reporter");
 process.env.LUVUS_ENV = "1";
 process.env.LUVUS_PANE_ID = "77";
