@@ -1067,6 +1067,15 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		stopStatusTicker();
 	});
 
+	// A switch keeps the process alive, so the previous session's records would answer
+	// the status tool and hand `resume` a child this session never started. The
+	// reference clears at the same boundary, for the same reason.
+	pi.on("session_before_switch", () => {
+		delegations.clear();
+		stopStatusTicker();
+		statusUi?.setWidget(STATUS_KEY, undefined);
+	});
+
 	/**
 	 * The parent can only delegate to an agent it knows about, so the catalogue is
 	 * rebuilt every turn and dropped into its own system-prompt section. Same

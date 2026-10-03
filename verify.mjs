@@ -595,6 +595,17 @@ check(
 	),
 );
 
+console.log("\nsession boundary");
+// A switch keeps the process alive, so records from the session being left must not
+// answer this one's status tool: the reference clears at the same boundary.
+for (const handler of handlers.get("session_before_switch") ?? []) await handler({}, ctx);
+const afterSwitch = await tools.subagent_status.execute("verify-switch", {}, undefined, undefined, ctx);
+check(
+	"a session switch forgets the previous session's delegations",
+	afterSwitch.content[0].text.includes("No delegations in this session"),
+	afterSwitch.content[0].text,
+);
+
 console.log("\nchild state reporter");
 process.env.LUVUS_ENV = "1";
 process.env.LUVUS_PANE_ID = "77";
