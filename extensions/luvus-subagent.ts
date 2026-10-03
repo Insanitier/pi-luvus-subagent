@@ -766,7 +766,10 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 			ended === "still running"
 				? `⌛ ${agentName} (still running after ${WAIT_SECONDS}s, ${sessionId})`
 				: `${ended === "done" ? "✓" : "✗"} ${agentName} (${line.word}, ${elapsed}, ${sessionId})`;
-		const body = [header, "", capCompletion(result === undefined ? "(no result was written)" : result.text)];
+		// A missing answer only needs saying while the child may still produce one: when the
+		// note already explains why there is none, the placeholder is noise.
+		const shown = result !== undefined ? capCompletion(result.text) : ended === "still running" ? "(no result was written)" : "";
+		const body = shown.length > 0 ? [header, "", shown] : [header];
 		if (line.note.length > 0) body.push("", line.note);
 		pi.sendMessage(
 			{
@@ -997,9 +1000,13 @@ function blockingResult(
 				type: "text",
 				text: [
 					`${agentName} (${line.word}):`,
-					"",
-					// Both surfaces protect the parent's context with the same limit.
-					capCompletion(result === undefined ? "(no result was written)" : result.text),
+					// A missing answer only needs saying while the child may still produce one;
+					// when the note explains why there is none, the line is noise.
+					...(result !== undefined
+						? ["", capCompletion(result.text)]
+						: ended === "still running"
+							? ["", "(no result was written)"]
+							: []),
 					...(body.length > 0 ? ["", ...body] : []),
 				].join("\n"),
 			},

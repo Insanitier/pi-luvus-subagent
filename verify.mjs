@@ -469,7 +469,9 @@ check(
 	"a closed pane ends the delegation instead of counting down",
 	gone.isError === true &&
 		gone.content[0].text.startsWith("fixture-bare (pane closed):") &&
-		gone.content[0].text.includes("was closed before it finished"),
+		gone.content[0].text.includes("was closed before it finished") &&
+		// The note explains the missing answer, so the placeholder would be noise.
+		!gone.content[0].text.includes("no result was written"),
 	gone.content[0].text,
 );
 check("a closed pane is never called still running", !gone.content[0].text.includes("still running"), gone.content[0].text);
