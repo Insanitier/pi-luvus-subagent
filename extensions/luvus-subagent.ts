@@ -843,6 +843,22 @@ const ERROR_LINGER_TURNS = 2;
 let turn = 0;
 
 /**
+ * The session entries the registry is rebuilt from.
+ *
+ * Pi stores a custom entry without sending it to the model, so the record costs no
+ * context and travels with the conversation: a reload, a restart or a compaction
+ * brings the delegations back instead of losing them with the process.
+ */
+const DELEGATION_ENTRY = "luvus-subagent-delegation";
+const SETTLED_ENTRY = "luvus-subagent-settled";
+
+type DelegationEntry = { sessionName: string; agent: string; task: string; pane: string; startedAt: number };
+type SettledEntry = { sessionName: string; state: "done" | "failed"; endedAt: number };
+
+/** The API entries are appended through; set once at load, like the widget's UI. */
+let entryApi: ExtensionAPI | undefined;
+
+/**
  * One entry per delegation this session, keyed by session name — the only id the
  * tool and the detached watcher both hold.
  *
@@ -937,7 +953,11 @@ function trackDelegation(sessionName: string, pane: string, ui: ExtensionUIConte
 
 function settleDelegation(sessionName: string, state: "done" | "failed"): void {
 	const entry = delegations.get(sessionName);
-	if (entry !== undefined) delegations.set(sessionName, { ...entry, endedAt: Date.now(), state, settledTurn: turn });
+	if (entry === undefined) return;
+	const endedAt = Date.now();
+	delegations.set(sessionName, { ...entry, endedAt, state, settledTurn: turn });
+	// The replay reads the last settled entry per delegation, so appending is enough.
+	entryApi?.appendEntry(SETTLED_ENTRY, { sessionName, state, endedAt } satisfies SettledEntry);
 	renderStatus();
 }
 
@@ -1060,6 +1080,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	let sessionStale = false;
 	// Completion notices are pushed into the transcript; this draws them as cards.
 	registerCompletionRenderer(pi);
+	entryApi = pi;
 
 	pi.on("session_shutdown", () => {
 		// The widget goes away with the session; stop the ticker and forget them.
@@ -1070,6 +1091,41 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	// A switch keeps the process alive, so the previous session's records would answer
 	// the status tool and hand `resume` a child this session never started. The
 	// reference clears at the same boundary, for the same reason.
+	// A reload or a restart must not lose the delegations: the records come back from
+	// this session's own entries rather than from the process that wrote them.
+	pi.on("session_start", async (_event, ctx) => {
+		turn = 0;
+		const started = new Map<string, DelegationEntry>();
+		const settled = new Map<string, SettledEntry>();
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type !== "custom") continue;
+			if (entry.customType === DELEGATION_ENTRY) {
+				const data = entry.data as DelegationEntry;
+				started.set(data.sessionName, data);
+			}
+			if (entry.customType === SETTLED_ENTRY) {
+				const data = entry.data as SettledEntry;
+				settled.set(data.sessionName, data);
+			}
+		}
+		delegations.clear();
+		for (const [name, start] of started) {
+			const end = settled.get(name);
+			// No settledTurn: a replayed row is queryable but never drawn, because the
+			// widget's linger is about this turn, and this turn did not run it.
+			delegations.set(name, { startedAt: start.startedAt, pane: start.pane, state: end?.state ?? "working", endedAt: end?.endedAt });
+		}
+		// A delegation with no settled entry was still running when the process went
+		// away, and its pane is the only thing left that can answer for it.
+		for (const [name, entry] of delegations) {
+			if (entry.state !== "working") continue;
+			if (await paneIsGone(pi, entry.pane)) {
+				delegations.set(name, { ...entry, state: "failed", endedAt: Date.now() });
+			}
+		}
+		renderStatus();
+	});
+
 	pi.on("session_before_switch", () => {
 		delegations.clear();
 		stopStatusTicker();
@@ -1179,6 +1235,13 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 
 			// 1. Launch the child in its own pane; the task follows as a message.
 			const pane = await launchChild(pi, sessionName, plan, ctx.hasUI ? ctx.ui : undefined);
+			pi.appendEntry(DELEGATION_ENTRY, {
+				sessionName,
+				agent: agent.name,
+				task: params.task,
+				pane,
+				startedAt: delegations.get(sessionName)?.startedAt ?? Date.now(),
+			} satisfies DelegationEntry);
 
 			// Blocking is the only difference between the two modes: the child owns a
 			// pane either way, so it stays visible and steerable throughout. `settled`

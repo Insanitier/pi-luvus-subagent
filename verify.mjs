@@ -161,6 +161,9 @@ const exec = (bin, args, options = {}) =>
 
 const tools = {};
 const notices = [];
+// Custom session entries: Pi stores them without sending them to the model, which is
+// what lets the registry survive a reload.
+const entries = [];
 const handlers = new Map();
 const noop = () => undefined;
 const pi = new Proxy(
@@ -168,6 +171,7 @@ const pi = new Proxy(
 		exec,
 		registerTool: (definition) => (tools[definition.name] = definition),
 		sendMessage: (message, options) => notices.push({ ...message, options }),
+		appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
 		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 	},
 	{ get: (target, key) => (key in target ? target[key] : noop) },
@@ -180,7 +184,7 @@ const ui = {
 	setStatus: (key, text) => frames.push({ kind: "status", key, text }),
 	setWidget: (key, content, options) => frames.push({ kind: "widget", key, content, options }),
 };
-const ctx = { cwd: HOME, hasUI: true, ui };
+const ctx = { cwd: HOME, hasUI: true, ui, sessionManager: { getEntries: () => entries, getSessionId: () => "parent-session" } };
 
 const failures = [];
 const check = (name, condition, detail = "") => {
@@ -605,6 +609,15 @@ check(
 	afterSwitch.content[0].text.includes("No delegations in this session"),
 	afterSwitch.content[0].text,
 );
+// The restart case: the process forgets, the conversation remembers. Firing
+// session_start on the same entries is what a reload does.
+for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+const replayed = await tools.subagent_status.execute("verify-replay", {}, undefined, undefined, ctx);
+check(
+	"a reload brings this session's delegations back",
+	/fixture-bare-[0-9a-f]{6}\s+(failed|done)/.test(replayed.content[0].text),
+	replayed.content[0].text,
+);
 
 console.log("\nchild state reporter");
 process.env.LUVUS_ENV = "1";
@@ -612,7 +625,7 @@ process.env.LUVUS_PANE_ID = "77";
 process.env.LUVUS_SOCKET_PATH = "/tmp/luvus-verify.sock";
 extension.default(pi);
 const reporterLogStart = readFileSync(STUB_LOG, "utf-8").length;
-const sessionCtx = { mode: "tui", isIdle: () => true, sessionManager: { getSessionId: () => "child-session" } };
+const sessionCtx = { mode: "tui", isIdle: () => true, sessionManager: { getSessionId: () => "child-session", getEntries: () => [] } };
 // Several handlers can share one event name (the reporter and the parent both
 // register session_shutdown), so fire every handler the extension registered.
 const fire = async (event, ctx = sessionCtx) => {
