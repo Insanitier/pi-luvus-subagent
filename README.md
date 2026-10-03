@@ -1,0 +1,44 @@
+# pi-luvus-subagent
+
+Pi extension for delegating work to subagents that run as real `pi` processes in Luvus panes, so every child is visible, interruptible, and steerable while it works.
+
+## Install
+
+```bash
+pi install git:github.com/Insanitier/pi-luvus-subagent
+```
+
+## Agents
+
+Subagents are declared once in Markdown, and their frontmatter becomes the child's launch argv:
+
+- `~/.pi/agent/agents/*.md` — user agents
+- `<project>/.pi/agents/*.md` — project agents, which win on a name clash
+
+`/subagent-agents` prints every agent that resolves and the `pi` argv it launches with.
+
+## Tools
+
+| Tool | What it does |
+| --- | --- |
+| `delegate` | Start an agent in a Luvus pane. `wait: true` (the default) blocks until it settles and returns its answer; `wait: false` returns as soon as the pane is up and the answer arrives later as a completion message. `dry_run: true` prints the resolved launch plan without starting anything. |
+| `steer` | Send another instruction to a running subagent. `interrupt: true` presses Esc first. |
+| `subagent_status` | List this session's delegations — name, state, duration, pane — or with `wait: true` block until one settles and return its answer. |
+
+## Status widget
+
+While at least one delegation is running, a list sits above the editor with one row per delegation (`◆ working`, `✓ done`, `✗ failed`) and live durations. A finished row stays only while it has a running neighbour to sit beside; the moment nothing is running the list is cleared, and the completion message carries the result.
+
+## Design
+
+The child owns its pane, so a delegation is out-of-process by construction: `wait` decides only whether the parent blocks, never where the child runs. A background delegation leaves its pane open so `steer` can still reach it.
+
+Completion notices are delivered as follow-ups, never steered mid-turn, so a notice cannot land between a tool call and its result.
+
+Child sessions live in `~/.pi/agent/subagent-sessions` and are swept after 7 days. A child is launched with `--subagent-child`, which loads this extension for state reporting only — handing the child the tools too would let subagents spawn subagents without bound.
+
+## Verify
+
+```bash
+npm test   # node verify.mjs — the whole extension against a stub CLI, no network
+```

@@ -1,0 +1,19 @@
+{
+  "name": "pi-luvus-subagent",
+  "version": "0.1.0",
+  "description": "Luvus-backed subagents for Pi: agent presets from .pi/agents, visible panes, steerable, blocking or background",
+  "keywords": ["pi-package", "pi", "subagent", "luvus", "delegation"],
+  "license": "MIT",
+  "scripts": {
+    "test": "node verify.mjs"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
