@@ -98,7 +98,7 @@ writeFileSync(STUB_LOG, "");
 writeFileSync(
 	STUB,
 	`#!/usr/bin/env node
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const argv = process.argv.slice(2);
 appendFileSync(process.env.LUVUS_STUB_LOG, argv.join(" ") + "\\n");
@@ -106,18 +106,25 @@ const ok = (result) => { process.stdout.write(JSON.stringify({ result })); proce
 const sessionDir = join(process.env.HOME, ".pi", "agent", "subagent-sessions");
 if (argv[0] === "agent" && argv[1] === "start") ok({ pane: "42" });
 if (argv[0] === "agent" && argv[1] === "prompt") {
-	// The child took the task: a user line exists, and its last turn is terminal.
-	// A task text of NEVER_PICKED simulates a child that never took it at all.
-	if (argv[3] !== "NEVER_PICKED") {
-		mkdirSync(sessionDir, { recursive: true });
+	// Typing is not submitting: Luvus puts the text in the child's input box, and the
+	// transcript only gains the turn once an Enter arrives.
+	mkdirSync(sessionDir, { recursive: true });
+	writeFileSync(join(sessionDir, argv[2] + ".pending"), argv[3]);
+	ok({});
+}
+if (argv[0] === "agent" && argv[1] === "keys" && argv[3] === "enter") {
+	const pending = join(sessionDir, argv[2] + ".pending");
+	// A task text of NEVER_PICKED simulates a child that never takes it, Enter or not.
+	const task = existsSync(pending) ? readFileSync(pending, "utf-8") : "NEVER_PICKED";
+	if (task !== "NEVER_PICKED") {
 		const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
-		const terminal = argv[3] === "ERRORED_TASK"
+		const terminal = task === "ERRORED_TASK"
 			? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
-			: argv[3] === "NO_ANSWER_TASK"
+			: task === "NO_ANSWER_TASK"
 				? undefined
 				: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
-		writeFileSync(file, [
-			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: argv[3] }] } }),
+		appendFileSync(file, (existsSync(file) ? "\\n" : "") + [
+			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: task }] } }),
 			...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
 		].join("\\n"));
 	}
@@ -134,7 +141,6 @@ if (argv[0] === "agent" && argv[1] === "get") {
 }
 if (argv[0] === "agent" && argv[1] === "report") ok({});
 if (argv[0] === "agent" && argv[1] === "release") ok({});
-if (argv[0] === "agent" && argv[1] === "keys") ok({});
 if (argv[0] === "pane" && argv[1] === "close") ok({});
 ok({});
 `,
@@ -347,6 +353,31 @@ check(
 	handedRows,
 );
 process.env.LUVUS_STUB_UNSETTLED = "";
+
+// A resumed session already holds older user messages, so "a user line exists" would
+// report a picked-up task before the new one was ever submitted — and the task would sit
+// in the child's input box. The delegation has to press Enter all the same.
+const resumeId = "resume-fixture";
+const resumeDir = join(HOME, ".pi", "agent", "subagent-sessions");
+mkdirSync(resumeDir, { recursive: true });
+writeFileSync(
+	join(resumeDir, `1970-01-01T00-00-00-000Z_${resumeId}.jsonl`),
+	JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "an older task" }] } }),
+);
+const resumeLogBefore = readFileSync(STUB_LOG, "utf-8");
+await tools.delegate.execute(
+	"verify-resume-submit",
+	{ agent: "fixture-bare", task: "the new task", resume: resumeId },
+	undefined,
+	undefined,
+	ctx,
+);
+const resumeLogAfter = readFileSync(STUB_LOG, "utf-8").slice(resumeLogBefore.length);
+check(
+	"a resumed delegation submits its task instead of assuming it was taken",
+	resumeLogAfter.includes(`agent keys ${resumeId} enter`),
+	resumeLogAfter.trim().split("\n").slice(0, 4).join(" | "),
+);
 
 // The submit loop is SUBMIT_ATTEMPTS x SUBMIT_PROBE_MS by design, so this one
 // check is the slow part of the suite (~20s).

@@ -674,19 +674,25 @@ function readChildResult(sessionId: string): ChildResult | undefined {
  * also infers it from process activity, and calls a child `working` before its
  * own reporter has said anything.
  */
-function childTookTask(sessionId: string): boolean {
+/**
+ * How many user turns a child's transcript holds. A resumed session already holds the
+ * ones it ran before, so what says "it took the task" is this count going up, not a
+ * user line existing.
+ */
+function countChildUserTurns(sessionId: string): number {
 	const filePath = sessionFileFor(sessionId);
-	if (filePath === undefined) return false;
+	if (filePath === undefined) return 0;
+	let turns = 0;
 	for (const line of readFileSync(filePath, "utf-8").split("\n")) {
 		if (!line.includes('"user"')) continue;
 		try {
 			const entry = JSON.parse(line) as { type?: string; message?: { role?: string } };
-			if (entry.type === "message" && entry.message?.role === "user") return true;
+			if (entry.type === "message" && entry.message?.role === "user") turns += 1;
 		} catch {
 			continue;
 		}
 	}
-	return false;
+	return turns;
 }
 /**
  * How much of a child's answer is pushed into the parent's context.
@@ -1035,11 +1041,12 @@ async function launchChild(
  * probe watches for.
  */
 async function submitUntilTaken(pi: ExtensionAPI, sessionName: string, task: string): Promise<boolean> {
+	const turnsBefore = countChildUserTurns(sessionName);
 	await submitTask(pi, sessionName, task);
 	let picked = false;
 	for (let attempt = 0; attempt < SUBMIT_ATTEMPTS && !picked; attempt++) {
 		await new Promise((resolve) => setTimeout(resolve, SUBMIT_PROBE_MS));
-		picked = childTookTask(sessionName);
+		picked = countChildUserTurns(sessionName) > turnsBefore;
 		// One Enter, never the text again: it is already in the input box.
 		if (!picked) await pressKey(pi, sessionName, "enter");
 	}
