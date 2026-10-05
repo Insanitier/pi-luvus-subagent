@@ -21,7 +21,7 @@ The agents that resolve are also listed in the parent's system prompt, rebuilt e
 
 | Tool | What it does |
 | --- | --- |
-| `delegate` | Start an agent in a Luvus pane. `wait: true` (the default) blocks until it settles and returns its answer; `wait: false` returns as soon as the pane is up and the answer arrives later as a completion message. `resume` continues a conversation this session already ran, or one named by child session id. `dry_run: true` prints the resolved launch plan without starting anything. |
+| `delegate` | Start an agent in a Luvus pane. `wait: true` (the default) blocks until it settles and returns its answer; a child that outlives that wait is handed to the same watcher a background delegation uses, so its answer still arrives and its pane is still closed. `wait: false` returns as soon as the pane is up and the answer arrives later as a completion message. `resume` continues a conversation this session already ran, or one named by child session id. `dry_run: true` prints the resolved launch plan without starting anything. |
 | `steer` | Send another instruction to a running subagent. `interrupt: true` presses Esc first. |
 | `subagent_status` | List this session's delegations — name, state, duration, pane — or with `wait: true` block until one settles and return its answer. |
 

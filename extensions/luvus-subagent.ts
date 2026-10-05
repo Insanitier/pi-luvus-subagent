@@ -407,6 +407,11 @@ const luvusBinary = (): string => process.env.LUVUS_BIN_PATH?.trim() || "luvus";
 
 /** How long a blocking delegation waits for the child before giving up. */
 const WAIT_SECONDS = 900;
+/**
+ * A wait that returns sooner than this did not run out, it failed. Re-arming on it
+ * would spin, so the watcher treats it as the end of its watching.
+ */
+const WAIT_FLOOR_MS = 1_000;
 
 /** How long a pane gets to close before it is left alone. */
 const PANE_CLOSE_TIMEOUT_MS = 15_000;
@@ -760,11 +765,21 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 	const startedAt = delegations.get(sessionId)?.startedAt ?? Date.now();
 	let outcome: SettleOutcome = "timeout";
 	try {
-		outcome = await waitForSettle(pi, pane);
+		// A wait that ran out is not the child's end, so the watcher keeps watching until
+		// it settles or its pane dies: a long task is never recorded as finished while it
+		// is still running. The floor stops a wait that fails at once from spinning.
+		for (;;) {
+			const cycleStart = Date.now();
+			outcome = await waitForSettle(pi, pane);
+			if (outcome !== "timeout" || Date.now() - cycleStart < WAIT_FLOOR_MS) break;
+			if (isStale()) break;
+		}
 		const result = readChildResult(sessionId);
 		// A closed pane is a delegation that ended without finishing; a wait that ran out
-		// leaves a child that is still working, which is not a failure.
-		settleDelegation(sessionId, outcome === "gone" || result?.status === "failed" ? "failed" : "done");
+		// leaves a child that is still working, which is not a failure and not an end.
+		if (outcome !== "timeout") {
+			settleDelegation(sessionId, outcome === "gone" || result?.status === "failed" ? "failed" : "done");
+		}
 		if (isStale()) return;
 
 		const elapsed = `${Math.round((Date.now() - startedAt) / 1000)}s`;
@@ -1320,9 +1335,20 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				if (outcome === "gone") notes.push(`its pane was closed before it finished; nothing is running in pane ${pane} any more`);
 				else if (!settled) notes.push(`did not settle within ${WAIT_SECONDS}s; it is still running in pane ${pane}`);
 				const result = readChildResult(sessionName);
-				// A child that outlived the wait is still working, and stays that way here.
+				// A child that outlived the wait is still working: hand it to the watcher, so
+				// its answer still arrives and its pane still gets closed once it settles.
+				// Without this the delegation falls between the two modes and is abandoned.
 				if (settled || outcome === "gone") {
 					settleDelegation(sessionName, settled && result?.status !== "failed" ? "done" : "failed");
+				} else {
+					void deliverWhenSettled({
+						pi,
+						pane,
+						sessionId: sessionName,
+						agentName: agent.name,
+						promptFile,
+						isStale: () => sessionStale,
+					});
 				}
 				return blockingResult(agent.name, outcome, result, notes);
 			} finally {

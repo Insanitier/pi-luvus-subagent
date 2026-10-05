@@ -328,6 +328,24 @@ check(
 		readFileSync(STUB_LOG, "utf-8").trim().split("\n").findLastIndex((line) => line.startsWith("pane close")),
 	readFileSync(STUB_LOG, "utf-8").trim().split("\n").at(-1),
 );
+// The wait ran out before the child did, so the delegation handed itself to the
+// watcher: it stays watched, and it is never recorded as finished while it runs.
+await new Promise((resolve) => setTimeout(resolve, 800));
+const handedCard = notices.find(
+	(n) => n.customType === "luvus-subagent-completion" && String(n.content).includes("still running after"),
+);
+const handedName = String(handedCard?.content).match(/fixture-bare-[0-9a-f]{6}/)?.[0];
+check(
+	"a blocking delegation that ran out is still watched",
+	handedCard !== undefined,
+	JSON.stringify(notices.filter((n) => n.customType === "luvus-subagent-completion").map((n) => String(n.content).slice(0, 70))),
+);
+const handedRows = (await tools.subagent_status.execute("verify-handed", {}, undefined, undefined, ctx)).content[0].text;
+check(
+	"a still-running delegation is not recorded as finished",
+	handedName !== undefined && new RegExp(`${handedName}\\s+working`).test(handedRows),
+	handedRows,
+);
 process.env.LUVUS_STUB_UNSETTLED = "";
 
 // The submit loop is SUBMIT_ATTEMPTS x SUBMIT_PROBE_MS by design, so this one
