@@ -671,6 +671,22 @@ check(
 	readFileSync(STUB_LOG, "utf-8").includes("-- --session /"),
 	readFileSync(STUB_LOG, "utf-8").trim().split("\n").at(-1),
 );
+// A caller that does not want to resume says so with false: that is the shape a model
+// which fills every optional parameter can actually produce, instead of inventing a
+// session name for a field it cannot leave empty.
+const freshFlag = await tools.delegate.execute(
+	"verify-fresh-flag",
+	{ agent: "fixture-bare", task: "say the thing", resume: false, wait: false },
+	undefined,
+	undefined,
+	ctx,
+);
+check(
+	"resume: false starts a fresh delegation",
+	freshFlag.isError !== true && freshFlag.content[0].text.startsWith("Delegated to"),
+	freshFlag.content[0].text,
+);
+
 const expired = await tools.delegate.execute(
 	"verify-expired",
 	{ agent: "fixture-bare", task: "x", resume: "no-such-session-zzzzzz" },

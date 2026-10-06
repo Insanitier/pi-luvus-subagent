@@ -1225,9 +1225,13 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			agent: Type.String({ description: "Agent name, from the subagents listed in your context" }),
 			task: Type.String({ description: "Task to delegate" }),
 			resume: Type.Optional(
-				Type.String({
+				// A boolean as well as a string: a caller that does not want to resume has
+				// to be able to say so. Some models fill every optional parameter and have
+				// no way to leave a string empty, so they invent a placeholder and the
+				// call fails; false is a value they can actually produce.
+				Type.Union([Type.Boolean(), Type.String()], {
 					description:
-						"Session name of a delegation this session already ran, or a child session id, to continue that conversation. Transcripts are kept for 7 days; once swept, resume is unavailable and the earlier result is only in the transcript.",
+						"Pass false (or omit it) to start a fresh delegation. Pass the session name of a delegation this session already ran, or a child session id, to continue that conversation. Transcripts are kept for 7 days; once swept, resume is unavailable and the earlier result is only in the transcript.",
 				}),
 			),
 			wait: Type.Optional(
@@ -1253,32 +1257,35 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			}
 
 			// Resume names a delegation this session ran, or a child session id. Both are
-			// the id its transcript is filed under, so one lookup serves both.
+			// the id its transcript is filed under, so one lookup serves both. Anything
+			// that is not a non-empty string means "start a fresh delegation".
+			const wantedResume =
+				typeof params.resume === "string" && params.resume.trim().length > 0 ? params.resume.trim() : undefined;
 			let resumeFile: string | undefined;
-			if (params.resume !== undefined) {
-				const known = delegations.get(params.resume);
+			if (wantedResume !== undefined) {
+				const known = delegations.get(wantedResume);
 				if (known !== undefined && known.state === "working") {
 					return {
 						content: [
-							{ type: "text", text: `${params.resume} is still running; steer it instead of resuming it.` },
+							{ type: "text", text: `${wantedResume} is still running; steer it instead of resuming it.` },
 						],
 						isError: true,
 					};
 				}
-				resumeFile = sessionFileFor(params.resume);
+				resumeFile = sessionFileFor(wantedResume);
 				if (resumeFile === undefined) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: `No session to resume for "${params.resume}": its transcript is gone (kept for ${SESSION_RETENTION_DAYS} days). Its earlier result is still in the transcript.`,
+								text: `No session to resume for "${wantedResume}": its transcript is gone (kept for ${SESSION_RETENTION_DAYS} days). Its earlier result is still in the transcript.`,
 							},
 						],
 						isError: true,
 					};
 				}
 			}
-			const sessionName = params.resume ?? `${agent.name}-${randomBytes(3).toString("hex")}`;
+			const sessionName = wantedResume ?? `${agent.name}-${randomBytes(3).toString("hex")}`;
 			const plan = prepareLaunch(agent, ctx.cwd, sessionName, resumeFile);
 			const { args, unresolvedSkills, promptFile } = plan;
 			const wait = params.wait ?? true;
