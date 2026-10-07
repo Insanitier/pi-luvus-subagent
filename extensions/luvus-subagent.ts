@@ -562,7 +562,7 @@ const TERMINAL_STOP_REASONS = new Set(["stop", "endTurn", "length", "error", "ab
  */
 type ChildOutcome = "done" | "truncated" | "aborted" | "error" | "no-answer" | "pane closed" | "still running";
 
-type ChildResult = { status: "completed" | "failed"; text: string; outcome: ChildOutcome; producedOutput: boolean };
+type ChildResult = { status: "completed" | "failed"; text: string; outcome: ChildOutcome };
 
 /**
  * The word and the parenthetical note for one outcome.
@@ -571,16 +571,14 @@ type ChildResult = { status: "completed" | "failed"; text: string; outcome: Chil
  * its salience, which is how a parent that reads partial output as a finished result
  * ends up delegating the same work twice. Same shape as `pi-subagents`.
  */
-function outcomeLine(outcome: ChildOutcome, producedOutput: boolean): { word: string; note: string } {
+function outcomeLine(outcome: ChildOutcome): { word: string; note: string } {
 	switch (outcome) {
 		case "truncated":
 			return { word: "truncated", note: "(hit the output limit before finishing — the answer may be truncated)" };
 		case "aborted":
 			return {
 				word: "aborted",
-				note: producedOutput
-					? "(its turn was interrupted — everything it produced is above; the task is unfinished)"
-					: "(aborted before it produced an answer; its pane is still there)",
+				note: "(aborted before it finished — the answer may be incomplete; its pane is still there)",
 			};
 		case "error":
 			return {
@@ -661,14 +659,12 @@ function readChildResult(sessionId: string): ChildResult | undefined {
 			status: "failed",
 			outcome: terminal.stopReason === "aborted" ? "aborted" : "error",
 			text: terminal.text.trim() || terminal.errorMessage?.trim() || `Subagent ${terminal.stopReason} before producing a result.`,
-			producedOutput: terminal.text.trim().length > 0,
 		};
 	}
 	return {
 		status: "completed",
 		outcome: terminal.stopReason === "length" ? "truncated" : "done",
 		text: terminal.text.trim() || "(no output)",
-		producedOutput: terminal.text.trim().length > 0,
 	};
 }
 
@@ -798,7 +794,7 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 		// The notice carries the same single dimension as the tool result.
 		const ended =
 			outcome === "gone" ? "pane closed" : outcome === "settled" ? (result?.outcome ?? "no-answer") : "still running";
-		const line = outcomeLine(ended, result?.producedOutput ?? false);
+		const line = outcomeLine(ended);
 		const header =
 			ended === "still running"
 				? `⌛ ${agentName} (still running after ${WAIT_SECONDS}s, ${sessionId})`
@@ -1071,7 +1067,7 @@ function blockingResult(
 	// and a turn that landed no answer is its own state rather than `done`.
 	const ended =
 		outcome === "gone" ? "pane closed" : outcome === "settled" ? (result?.outcome ?? "no-answer") : "still running";
-	const line = outcomeLine(ended, result?.producedOutput ?? false);
+	const line = outcomeLine(ended);
 	const body = [...notes];
 	if (line.note.length > 0) body.push(line.note);
 	return {

@@ -578,7 +578,7 @@ const aborted = await tools.delegate.execute("verify-aborted", { agent: "fixture
 check(
 	"an interrupted turn keeps what it produced",
 	aborted.content[0].text.includes("STUB_PARTIAL_ANSWER") &&
-		aborted.content[0].text.includes("everything it produced is above") &&
+		aborted.content[0].text.includes("aborted before it finished") &&
 		!aborted.content[0].text.includes("Operation aborted"),
 	aborted.content[0].text,
 );
