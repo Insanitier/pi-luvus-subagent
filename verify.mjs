@@ -120,9 +120,16 @@ if (argv[0] === "agent" && argv[1] === "keys" && argv[3] === "enter") {
 		const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
 		const terminal = task === "ERRORED_TASK"
 			? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
-			: task === "NO_ANSWER_TASK"
-				? undefined
-				: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
+			: task === "ABORTED_WITH_OUTPUT_TASK"
+				? {
+						role: "assistant",
+						stopReason: "aborted",
+						errorMessage: "Operation aborted",
+						content: [{ type: "text", text: "STUB_PARTIAL_ANSWER" }],
+					}
+				: task === "NO_ANSWER_TASK"
+					? undefined
+					: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
 		appendFileSync(file, (existsSync(file) ? "\\n" : "") + [
 			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: task }] } }),
 			...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
@@ -564,6 +571,16 @@ check(
 		errored.content[0].text.includes("upstream: connection reset") &&
 		errored.content[0].text.includes("the task did not finish"),
 	errored.content[0].text,
+);
+// An interrupted turn that had already written its answer keeps that answer: the
+// provider's "Operation aborted" line must not outrank what the turn produced.
+const aborted = await tools.delegate.execute("verify-aborted", { agent: "fixture-bare", task: "ABORTED_WITH_OUTPUT_TASK" }, undefined, undefined, ctx);
+check(
+	"an interrupted turn keeps what it produced",
+	aborted.content[0].text.includes("STUB_PARTIAL_ANSWER") &&
+		aborted.content[0].text.includes("everything it produced is above") &&
+		!aborted.content[0].text.includes("Operation aborted"),
+	aborted.content[0].text,
 );
 // Settling without writing anything is not a finished task: it is its own state.
 const noAnswer = await tools.delegate.execute("verify-no-answer", { agent: "fixture-bare", task: "NO_ANSWER_TASK" }, undefined, undefined, ctx);
