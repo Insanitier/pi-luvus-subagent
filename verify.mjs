@@ -17,7 +17,7 @@
  * real pane. Run it with `node verify.mjs` (or `npm test`).
  */
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -25,6 +25,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const EXTENSION = join(HERE, "extensions", "luvus-subagent.ts");
+// Every temp path below — and the prompt directory the extension computes at import
+// time — must land in this run's own dir, or a test run would sweep the shared one.
+process.env.TMPDIR = mkdtempSync(join(tmpdir(), "luvus-verify-"));
 
 // ── 0. Locate the Pi SDK, so its bare imports resolve outside the Pi runtime ──
 const sdkRoot = (() => {
@@ -61,6 +64,9 @@ const SESSION_DIR = join(AGENT_DIR, "subagent-sessions");
 const PROMPT_DIR = join(tmpdir(), "luvus-subagent-prompts");
 mkdirSync(join(AGENT_DIR, "agents"), { recursive: true });
 mkdirSync(SESSION_DIR, { recursive: true });
+// The prompt directory exists only once something writes to it, and the checks below
+// read it, so this run creates its own.
+mkdirSync(PROMPT_DIR, { recursive: true });
 process.env.HOME = HOME;
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 
@@ -106,36 +112,31 @@ const ok = (result) => { process.stdout.write(JSON.stringify({ result })); proce
 const sessionDir = join(process.env.HOME, ".pi", "agent", "subagent-sessions");
 if (argv[0] === "agent" && argv[1] === "start") ok({ pane: "42" });
 if (argv[0] === "agent" && argv[1] === "prompt") {
-	// Typing is not submitting: Luvus puts the text in the child's input box, and the
-	// transcript only gains the turn once an Enter arrives.
+	// Luvus submits atomically: the text and the Enter are one call, and with
+	// The --wait --until working flags make it report whether it saw the child start.
 	mkdirSync(sessionDir, { recursive: true });
-	writeFileSync(join(sessionDir, argv[2] + ".pending"), argv[3]);
-	ok({});
-}
-if (argv[0] === "agent" && argv[1] === "keys" && argv[3] === "enter") {
-	const pending = join(sessionDir, argv[2] + ".pending");
-	// A task text of NEVER_PICKED simulates a child that never takes it, Enter or not.
-	const task = existsSync(pending) ? readFileSync(pending, "utf-8") : "NEVER_PICKED";
-	if (task !== "NEVER_PICKED") {
-		const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
-		const terminal = task === "ERRORED_TASK"
-			? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
-			: task === "ABORTED_WITH_OUTPUT_TASK"
-				? {
-						role: "assistant",
-						stopReason: "aborted",
-						errorMessage: "Operation aborted",
-						content: [{ type: "text", text: "STUB_PARTIAL_ANSWER" }],
-					}
-				: task === "NO_ANSWER_TASK"
-					? undefined
-					: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
-		appendFileSync(file, (existsSync(file) ? "\\n" : "") + [
-			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: task }] } }),
-			...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
-		].join("\\n"));
-	}
-	ok({});
+	const task = argv[3];
+	// A task text of NEVER_PICKED is a child the host took the text for but never saw
+	// start working, which is what the extension reads instead of the transcript.
+	if (task === "NEVER_PICKED") ok({ submitted: true, matched: false, status: "working" });
+	const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
+	const terminal = task === "ERRORED_TASK"
+		? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
+		: task === "ABORTED_WITH_OUTPUT_TASK"
+			? {
+					role: "assistant",
+					stopReason: "aborted",
+					errorMessage: "Operation aborted",
+					content: [{ type: "text", text: "STUB_PARTIAL_ANSWER" }],
+				}
+			: task === "NO_ANSWER_TASK"
+				? undefined
+				: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
+	appendFileSync(file, (existsSync(file) ? "\\n" : "") + [
+		JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: task }] } }),
+		...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
+	].join("\\n"));
+	ok({ submitted: true, matched: true, status: "working" });
 }
 if (argv[0] === "wait") process.exit(process.env.LUVUS_STUB_GONE === "1" ? 2 : process.env.LUVUS_STUB_UNSETTLED === "1" ? 1 : 0);
 if (argv[0] === "agent" && argv[1] === "get") {
@@ -210,7 +211,14 @@ const ui = {
 	setStatus: (key, text) => frames.push({ kind: "status", key, text }),
 	setWidget: (key, content, options) => frames.push({ kind: "widget", key, content, options }),
 };
-const ctx = { cwd: HOME, hasUI: true, ui, sessionManager: { getEntries: () => entries, getSessionId: () => "parent-session" } };
+// The replay reads the active branch; in the stub the whole session is one branch, so
+// `getBranch` and `getEntries` are the same list.
+const ctx = {
+	cwd: HOME,
+	hasUI: true,
+	ui,
+	sessionManager: { getEntries: () => entries, getBranch: () => entries, getSessionId: () => "parent-session" },
+};
 
 const failures = [];
 const check = (name, condition, detail = "") => {
@@ -242,13 +250,18 @@ check(
 	"replace mode passes the empty append pair",
 	bare.args.includes("--append-system-prompt") && bare.args[bare.args.indexOf("--append-system-prompt") + 1] === "",
 );
-check("prompt file written owner-only", (() => {
-	try {
-		return (readFileSync(bare.promptFile, "utf-8").length > 0) && true;
-	} catch {
-		return false;
-	}
-})());
+// prepareLaunch only names the prompt file; the caller writes it. So the plan is
+// checked for the path, and the write is checked through the same function a
+// delegation uses — including the mode, which is what keeps the body owner-only.
+// PROMPT_DIR is the real, shared temp directory, so a file left behind by an aborted run
+// has to go first: otherwise this check fails for a reason that has nothing to do with it.
+rmSync(bare.promptFile, { force: true });
+check("the plan names the prompt file without creating it", !existsSync(bare.promptFile));
+extension.writePromptFile(bare.promptFile, "fixture body");
+check(
+	"prompt file written owner-only",
+	readFileSync(bare.promptFile, "utf-8") === "fixture body" && (statSync(bare.promptFile).mode & 0o777) === 0o600,
+);
 
 const full = extension.prepareLaunch(
 	extension.discoverAgents(HOME).find((agent) => agent.name === "fixture-full"),
@@ -333,6 +346,7 @@ check(
 // Only this check wants the stub to report an unsettled wait; the happy path
 // above ran with the default (settled) behaviour.
 process.env.LUVUS_STUB_UNSETTLED = "1";
+const handoffLog = readFileSync(STUB_LOG, "utf-8").length;
 frames.length = 0;
 const unsettled = await tools.delegate.execute(
 	"verify-unsettled",
@@ -343,7 +357,7 @@ const unsettled = await tools.delegate.execute(
 );
 check(
 	"a child that never settles is reported as still running, not as an error",
-	unsettled.isError !== true && unsettled.content[0].text.includes("still running in pane 42"),
+	unsettled.isError !== true && unsettled.content[0].text.includes("still running after"),
 	unsettled.content[0].text,
 );
 check(
@@ -355,21 +369,19 @@ check(
 	readFileSync(STUB_LOG, "utf-8").trim().split("\n").at(-1),
 );
 // The wait ran out before the child did, so the delegation handed itself to the
-// watcher: it stays watched, and it is never recorded as finished while it runs.
+// watcher. It stays watched — a notice only comes when the child actually ends — and
+// it is never recorded as finished while it runs.
 await new Promise((resolve) => setTimeout(resolve, 800));
-const handedCard = notices.find(
-	(n) => n.customType === "luvus-subagent-completion" && noticeText(n).includes("still running after"),
-);
-const handedName = noticeText(handedCard ?? { content: "" }).match(/fixture-bare-[0-9a-f]{6}/)?.[0];
+const handedLog = readFileSync(STUB_LOG, "utf-8").slice(handoffLog).trim().split("\n");
 check(
 	"a blocking delegation that ran out is still watched",
-	handedCard !== undefined,
-	JSON.stringify(notices.filter((n) => n.customType === "luvus-subagent-completion").map((n) => noticeText(n).slice(0, 70))),
+	handedLog.some((line) => line.startsWith("wait agent-status")),
+	handedLog.slice(0, 4).join(" | "),
 );
 const handedRows = (await tools.subagent_status.execute("verify-handed", {}, undefined, undefined, ctx)).content[0].text;
 check(
 	"a still-running delegation is not recorded as finished",
-	handedName !== undefined && new RegExp(`${handedName}\\s+working`).test(handedRows),
+	/fixture-bare-[0-9a-f]{6}\s+working/.test(handedRows),
 	handedRows,
 );
 process.env.LUVUS_STUB_UNSETTLED = "";
@@ -394,8 +406,8 @@ await tools.delegate.execute(
 );
 const resumeLogAfter = readFileSync(STUB_LOG, "utf-8").slice(resumeLogBefore.length);
 check(
-	"a resumed delegation submits its task instead of assuming it was taken",
-	resumeLogAfter.includes(`agent keys ${resumeId} enter`),
+	"a resumed delegation submits through the host's own confirmation",
+	resumeLogAfter.includes(`agent prompt ${resumeId} the new task --wait --until working`),
 	resumeLogAfter.trim().split("\n").slice(0, 4).join(" | "),
 );
 
@@ -411,7 +423,7 @@ const unpicked = await tools.delegate.execute(
 );
 check(
 	"a task the child never took is an error that says so",
-	unpicked.isError === true && unpicked.content[0].text.includes("never picked the task up"),
+	unpicked.isError === true && unpicked.content[0].text.includes("never started working"),
 	unpicked.content[0].text,
 );
 check(
@@ -465,13 +477,15 @@ check(
 	JSON.stringify(notices[0]?.content ?? null),
 );
 check("the detached watcher closed the pane", readFileSync(STUB_LOG, "utf-8").includes("pane close 42"));
-// A notice is information, not a redirect: steered mid-turn it can land between a
-// tool call and its result, so every notice must be a follow-up.
+// While the parent is streaming, Pi reads this mode: a steer lands after the current turn's
+// tool calls and before the next model call, where a follow-up waits for the whole turn to
+// end. While the parent is idle the two are the same, so this pins the choice that was made,
+// not a timing guarantee.
 check(
-	"every completion notice is delivered as a follow-up, never a steer",
+	"every completion notice asks to be steered, not queued as a follow-up",
 	notices.length > 0 &&
 		notices.every(
-			(notice) => notice.options?.deliverAs === "followUp" && notice.options?.triggerTurn === true,
+			(notice) => notice.options?.deliverAs === "steer" && notice.options?.triggerTurn === true,
 		),
 	JSON.stringify(notices.map((notice) => notice.options)),
 );
@@ -519,8 +533,16 @@ check(
 	drawn.slice(0, 240),
 );
 console.log("\nstatus tool (the pi-task shape: pull, no bash)");
-// The registry drops settled rows whenever a new delegation starts, so by now it
-// holds the unsettled child (still working) and the background one (done).
+// The list needs a live row, and a row stays live only while its watcher holds a wait
+// that never returns: this child is started with the stub reporting an unsettled wait.
+process.env.LUVUS_STUB_UNSETTLED = "1";
+await tools.delegate.execute(
+	"verify-status-live",
+	{ agent: "fixture-bare", task: "say the thing", wait: false },
+	undefined,
+	undefined,
+	ctx,
+);
 const listed = await tools.subagent_status.execute("verify-status", {}, undefined, undefined, ctx);
 const listText = listed.content[0].text;
 check("status lists a working row", /fixture-bare-[0-9a-f]{6}\s+working/.test(listText), listText);
@@ -555,6 +577,8 @@ check(
 	noSuch.content[0].text,
 );
 
+// The wait below needs a child that does settle, so the stub's wait answers again.
+process.env.LUVUS_STUB_UNSETTLED = "";
 // The point of the tool: waiting for a child without spawning a bash command.
 const bgAgain = await tools.delegate.execute(
 	"verify-bg3",
@@ -673,10 +697,11 @@ const steered = await tools.steer.execute(
 	ctx,
 );
 const steerLog = readFileSync(STUB_LOG, "utf-8").slice(logBefore).trim().split("\n");
-check("steer reports what it did", steered.content[0].text.includes("Interrupted, then sent"), steered.content[0].text);
+check("steer reports what it did", steered.content[0].text.includes("Interrupted, then"), steered.content[0].text);
 check(
 	"steer interrupts before it prompts",
-	steerLog[0] === "agent keys fixture-bare-deadbe esc" && steerLog[1] === "agent prompt fixture-bare-deadbe go left",
+	steerLog[0] === "agent keys fixture-bare-deadbe esc" &&
+		steerLog[1].startsWith("agent prompt fixture-bare-deadbe go left --wait --until working"),
 	steerLog.join(" | "),
 );
 
@@ -723,6 +748,15 @@ check(
 );
 
 console.log("\nresume");
+// The check below needs a running delegation, so start one the stub keeps unsettled.
+process.env.LUVUS_STUB_UNSETTLED = "1";
+await tools.delegate.execute(
+	"verify-resume-live",
+	{ agent: "fixture-bare", task: "say the thing", wait: false },
+	undefined,
+	undefined,
+	ctx,
+);
 // A delegation this session ran can be continued: Pi's own `--session <file>` reopens
 // that conversation, and the id it already carries is the one this delegation keeps.
 const resumeList = (await tools.subagent_status.execute("verify-resume-list", {}, undefined, undefined, ctx)).content[0].text;
@@ -787,9 +821,11 @@ check(
 );
 
 console.log("\nsession boundary");
-// A switch keeps the process alive, so records from the session being left must not
-// answer this one's status tool: the reference clears at the same boundary.
-for (const handler of handlers.get("session_before_switch") ?? []) await handler({}, ctx);
+// A switch keeps the process alive, so records from the session being left must not answer
+// this one's status tool. The boundary is `session_shutdown`, which fires for a real
+// replacement — `session_before_switch` is cancellable, so clearing there would wipe the
+// registry of a session that carries on.
+for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: "resume" }, ctx);
 const afterSwitch = await tools.subagent_status.execute("verify-switch", {}, undefined, undefined, ctx);
 check(
 	"a session switch forgets the previous session's delegations",
@@ -798,6 +834,7 @@ check(
 );
 // The restart case: the process forgets, the conversation remembers. Firing
 // session_start on the same entries is what a reload does.
+const replayLog = readFileSync(STUB_LOG, "utf-8").length;
 for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
 const replayed = await tools.subagent_status.execute("verify-replay", {}, undefined, undefined, ctx);
 check(
@@ -805,14 +842,28 @@ check(
 	/fixture-bare-[0-9a-f]{6}\s+(failed|done)/.test(replayed.content[0].text),
 	replayed.content[0].text,
 );
-
+// A delegation that outlived the instance that started it has no watcher left, so the
+// replay has to arm one: the invariant is that a `working` record always has a watcher.
+await new Promise((resolve) => setTimeout(resolve, 1200));
+const replayLines = readFileSync(STUB_LOG, "utf-8").slice(replayLog).trim().split("\n");
+check(
+	"a replayed delegation that is still running gets a watcher again",
+	replayLines.some((line) => line.startsWith("wait agent-status")),
+	replayLines.slice(0, 4).join(" | "),
+);
 console.log("\nchild state reporter");
 process.env.LUVUS_ENV = "1";
 process.env.LUVUS_PANE_ID = "77";
 process.env.LUVUS_SOCKET_PATH = "/tmp/luvus-verify.sock";
 extension.default(pi);
 const reporterLogStart = readFileSync(STUB_LOG, "utf-8").length;
-const sessionCtx = { mode: "tui", isIdle: () => true, sessionManager: { getSessionId: () => "child-session", getEntries: () => [] } };
+// A child session fires the same handlers, so this context needs `getBranch` too: the
+// parent's replay runs on it and reads the branch it is given.
+const sessionCtx = {
+	mode: "tui",
+	isIdle: () => true,
+	sessionManager: { getSessionId: () => "child-session", getEntries: () => [], getBranch: () => [] },
+};
 // Several handlers can share one event name (the reporter and the parent both
 // register session_shutdown), so fire every handler the extension registered.
 const fire = async (event, ctx = sessionCtx) => {
