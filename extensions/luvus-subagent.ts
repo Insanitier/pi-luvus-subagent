@@ -17,6 +17,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	CONFIG_DIR_NAME,
+	CustomEditor,
 	type ExtensionAPI,
 	type ExtensionUIContext,
 	getAgentDir,
@@ -424,12 +425,19 @@ const PANE_CLOSE_TIMEOUT_MS = 15_000;
 
 /** How long a single key press gets to reach the child. */
 const KEYSTROKE_TIMEOUT_MS = 15_000;
+/** How long `agent prompt` gets to paste the task into the child's editor. */
+const PROMPT_SUBMIT_TIMEOUT_MS = 30_000;
+/** How long one read of a child's state gets. */
+const AGENT_STATUS_TIMEOUT_MS = 10_000;
+
+/** How often that read is repeated while a fresh child decides to start. */
+const START_POLL_MS = 1_000;
 
 /** How much of a CLI's stderr is quoted back when its reply is unreadable. */
 const STDERR_TAIL_CHARS = 200;
 
-/** How long a fresh child gets to start working before its task counts as unstarted. */
-const START_CONFIRM_SECONDS = 60;
+/** How long a fresh child gets to leave `idle` before its task counts as unstarted. Measured: a second. */
+const START_CONFIRM_SECONDS = 15;
 
 /** How long a steer to a busy child waits for the host to see it picked the message up. */
 const STEER_CONFIRM_SECONDS = 15;
@@ -1135,14 +1143,31 @@ async function launchChild(
 }
 
 /**
- * Submit to a child and let the host say what it saw.
+ * The host's own view of a child's state, or undefined when it cannot be read (a pane
+ * that is gone answers with an error envelope, which `callLuvus` throws on).
+ */
+async function agentStatus(pi: ExtensionAPI, sessionName: string): Promise<string | undefined> {
+	try {
+		const reply = await callLuvus(pi, ["agent", "get", sessionName], AGENT_STATUS_TIMEOUT_MS);
+		return typeof reply.result.status === "string" ? reply.result.status : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Hand a task to a child and let the host say whether it started.
  *
- * `agent prompt` submits atomically — the host reports `submitted` itself — so the old
- * paste-then-Enter dance and its transcript counting are not needed. `--wait --until
- * working` asks the host to observe the child *start* working, which is the only
- * evidence that it took the message. A child that is already busy raises no new
- * transition, so the answer there is a timeout: "queued, not confirmed", which is true
- * and is not a failure.
+ * Two steps, because one is not enough: `agent prompt` pastes the text, and a long
+ * multi-line paste is *not* submitted by it — measured against the real CLI, where a
+ * 12-line paste sat in the child's editor until a separate `agent keys <target> enter`.
+ *
+ * The evidence is the host's own `status` field, read rather than waited on: `wait
+ * agent-status` only sees transitions that begin *after* it starts, and by then the paste
+ * and Enter have already happened, so it can only ever time out. Measured: a fresh child
+ * is `idle`, and paste + Enter moves it to `working` within a second. A child that was
+ * already busy cannot be judged this way — its status proves nothing about *this*
+ * message — so the answer there is "queued, not confirmed": true, and not a failure.
  */
 async function submitAndConfirm(
 	pi: ExtensionAPI,
@@ -1150,14 +1175,20 @@ async function submitAndConfirm(
 	task: string,
 	seconds: number,
 ): Promise<"taken" | "queued"> {
-	const reply = await callLuvus(
-		pi,
-		["agent", "prompt", sessionName, task, "--wait", "--until", "working", "--timeout", String(seconds)],
-		(seconds + 30) * 1000,
-	);
-	// `status` is what the host last saw: a child that finished before the transition was
-	// observed did take it, and only the absence of both means we cannot say.
-	return reply.result.matched === true || reply.result.status === "done" ? "taken" : "queued";
+	// A busy child is unreadable from here: its status is already working, so nothing it
+	// does afterwards is evidence about this message.
+	const before = await agentStatus(pi, sessionName);
+	// Paste, then submit: a long paste leaves the text sitting in the editor.
+	await callLuvus(pi, ["agent", "prompt", sessionName, task], PROMPT_SUBMIT_TIMEOUT_MS);
+	await pressKey(pi, sessionName, "enter");
+	if (before !== "idle") return "queued";
+	// A fresh child is idle, so any other status means it took what we just sent.
+	const deadline = Date.now() + seconds * 1000;
+	while (Date.now() < deadline) {
+		if ((await agentStatus(pi, sessionName)) !== "idle") return "taken";
+		await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
+	}
+	return "queued";
 }
 
 /** The blocking path's tool result: the child's answer, capped, plus any notes. */
@@ -1192,6 +1223,66 @@ function blockingResult(
 }
 
 
+// ── The child's editor: a pasted task is text, never a paste marker ────────
+
+/** The markers a terminal wraps a bracketed paste in. */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+
+/**
+ * An editor that takes a bracketed paste as typed text.
+ *
+ * Pi condenses a large paste into a marker in the editor, and a task delivered
+ * through the child's pane arrives as exactly one bracketed paste — so the marker is
+ * what the model ends up seeing. Feeding the paste back through `handleInput` one
+ * character at a time leaves the text itself in the editor instead.
+ *
+ * The technique is raw-paste's (github.com/tmustier/pi-extensions). Unlike it there
+ * is no arming command: this is installed only in a child, where every paste is a
+ * machine handing over a task and the marker is never wanted. Newlines are fed as
+ * `\n`, which is what that extension normalises to for the same reason.
+ */
+class RawPasteEditor extends CustomEditor {
+	private buffering = false;
+	private buffer = "";
+
+	handleInput(data: string): void {
+		if (this.buffering) {
+			this.buffer += data;
+			const end = this.buffer.indexOf(PASTE_END);
+			if (end === -1) return;
+			const pasted = this.buffer.slice(0, end);
+			const rest = this.buffer.slice(end + PASTE_END.length);
+			this.buffer = "";
+			this.buffering = false;
+			for (const char of pasted.replace(/\r\n?/g, "\n")) super.handleInput(char);
+			if (rest.length > 0) this.handleInput(rest);
+			return;
+		}
+		const start = data.indexOf(PASTE_START);
+		if (start === -1) {
+			super.handleInput(data);
+			return;
+		}
+		super.handleInput(data.slice(0, start));
+		this.buffering = true;
+		this.handleInput(data.slice(start + PASTE_START.length));
+	}
+}
+
+/**
+ * Install that editor, in a child only.
+ *
+ * A human's editor wants the marker — it is how a big paste stays editable — so this
+ * is never installed where someone is typing. A child has no UI worth the trade.
+ */
+function installRawPaste(pi: ExtensionAPI): void {
+	pi.on("session_start", (_event, ctx) => {
+		if (!ctx.hasUI) return;
+		ctx.ui.setEditorComponent((tui, theme, keybindings) => new RawPasteEditor(tui, theme, keybindings));
+	});
+}
+
 // ── Extension entry ────────────────────────────────────────────────────────
 
 export default function luvusSubagent(pi: ExtensionAPI) {
@@ -1206,9 +1297,13 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		description: "Run as a subagent child: report state, but offer no delegation tools.",
 	});
 
-	// A child loads this extension only for the reporter above. Handing it the
-	// tools too would let subagents spawn subagents without bound.
-	if (process.argv.includes(`--${SUBAGENT_CHILD_FLAG}`)) return;
+	// A child loads this extension for the reporter above, and for the editor that keeps
+	// a pasted task from reaching its model as a marker. Handing it the tools too would
+	// let subagents spawn subagents without bound.
+	if (process.argv.includes(`--${SUBAGENT_CHILD_FLAG}`)) {
+		installRawPaste(pi);
+		return;
+	}
 
 	/** Set while this session is being torn down, so a watcher never messages a dead one. */
 	let sessionStale = false;
@@ -1434,10 +1529,18 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				// 2. Hand the task over, and let the host say whether the child started.
 				const started = await submitAndConfirm(pi, sessionName, params.task, START_CONFIRM_SECONDS);
 				if (started === "queued") {
+					// A pane that is already gone is not an unstarted task: report it the way every
+					// other closed pane is, not as a countdown that never ran.
+					if (await paneIsGone(pi, pane)) {
+						settleDelegation(sessionName, "failed");
+						settled = true;
+						markReported(sessionName);
+						return blockingResult(agent.name, "gone", undefined, []);
+					}
 					// Waiting on a child that never started would block for WAIT_SECONDS.
 					settleDelegation(sessionName, "failed");
 					settled = true;
-					const unpicked = `${sessionName} never started working: the host took the task but saw no transition within ${START_CONFIRM_SECONDS}s. Its pane is left open with the task in its input box.`;
+					const unpicked = `${sessionName} never started working: it stayed idle for ${START_CONFIRM_SECONDS}s after the task was pasted and submitted. Nothing is running; its pane is closed.`;
 					return { content: [{ type: "text", text: unpicked }], isError: true };
 				}
 				if (wait) {
@@ -1530,13 +1633,13 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				}
 				const how = params.interrupt === true ? "Interrupted, then" : "Sent to";
 				const verdict = await submitAndConfirm(pi, params.sessionName, params.message, STEER_CONFIRM_SECONDS);
-				// The host submits atomically, so "the message is in" is a fact. Whether the child
-				// has *taken* it is visible only as a transition into working, and a busy child
-				// raises none — so say which of the two is known.
+				// Two facts, and only two: the host took the message, and — for a child that was
+				// idle — whether it started. A busy child proves nothing about this message, so
+				// "queued" is the honest answer there, not a failure.
 				const text =
 					verdict === "taken"
-						? `${how} ${params.sessionName}, which started working on it.`
-						: `${how} ${params.sessionName} — the host took the message, but the child was still busy, so pickup is not confirmed.`;
+						? `${how} ${params.sessionName}, and it is working.`
+						: `${how} ${params.sessionName} — queued; the host took the message, but pickup is not confirmed.`;
 				return { content: [{ type: "text", text }] };
 			} catch (error) {
 				return {

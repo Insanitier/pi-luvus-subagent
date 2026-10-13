@@ -110,33 +110,46 @@ const argv = process.argv.slice(2);
 appendFileSync(process.env.LUVUS_STUB_LOG, argv.join(" ") + "\\n");
 const ok = (result) => { process.stdout.write(JSON.stringify({ result })); process.exit(0); };
 const sessionDir = join(process.env.HOME, ".pi", "agent", "subagent-sessions");
-if (argv[0] === "agent" && argv[1] === "start") ok({ pane: "42" });
+if (argv[0] === "agent" && argv[1] === "start") {
+	// A fresh child is idle, whatever a previous delegation under this name left behind.
+	writeFileSync(join(sessionDir, argv[2] + ".state"), "idle");
+	ok({ pane: "42" });
+}
 if (argv[0] === "agent" && argv[1] === "prompt") {
-	// Luvus submits atomically: the text and the Enter are one call, and with
-	// The --wait --until working flags make it report whether it saw the child start.
+	// Pasting is not submitting: Luvus puts the text in the child's input box, and the
+	// transcript only gains the turn once an Enter arrives — measured against the real
+	// CLI, where a 12-line paste sat unsent until a separate agent keys <target> enter.
 	mkdirSync(sessionDir, { recursive: true });
-	const task = argv[3];
-	// A task text of NEVER_PICKED is a child the host took the text for but never saw
-	// start working, which is what the extension reads instead of the transcript.
-	if (task === "NEVER_PICKED") ok({ submitted: true, matched: false, status: "working" });
-	const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
-	const terminal = task === "ERRORED_TASK"
-		? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
-		: task === "ABORTED_WITH_OUTPUT_TASK"
-			? {
-					role: "assistant",
-					stopReason: "aborted",
-					errorMessage: "Operation aborted",
-					content: [{ type: "text", text: "STUB_PARTIAL_ANSWER" }],
-				}
-			: task === "NO_ANSWER_TASK"
-				? undefined
-				: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
-	appendFileSync(file, (existsSync(file) ? "\\n" : "") + [
-		JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: task }] } }),
-		...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
-	].join("\\n"));
-	ok({ submitted: true, matched: true, status: "working" });
+	writeFileSync(join(sessionDir, argv[2] + ".pending"), argv[3]);
+	ok({ submitted: true });
+}
+if (argv[0] === "agent" && argv[1] === "keys" && argv[3] === "enter") {
+	const pending = join(sessionDir, argv[2] + ".pending");
+	// A task text of NEVER_PICKED is a child that never starts working, Enter or not.
+	const task = existsSync(pending) ? readFileSync(pending, "utf-8") : "NEVER_PICKED";
+	// The host's view of the child: idle until the Enter lands, then working. NEVER_PICKED
+	// never leaves idle, which is what an unpicked delegation looks like from here.
+	writeFileSync(join(sessionDir, argv[2] + ".state"), task === "NEVER_PICKED" ? "idle" : "working");
+	if (task !== "NEVER_PICKED") {
+		const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
+		const terminal = task === "ERRORED_TASK"
+			? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
+			: task === "ABORTED_WITH_OUTPUT_TASK"
+				? {
+						role: "assistant",
+						stopReason: "aborted",
+						errorMessage: "Operation aborted",
+						content: [{ type: "text", text: "STUB_PARTIAL_ANSWER" }],
+					}
+				: task === "NO_ANSWER_TASK"
+					? undefined
+					: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
+		appendFileSync(file, (existsSync(file) ? "\\n" : "") + [
+			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: task }] } }),
+			...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
+		].join("\\n"));
+	}
+	ok({});
 }
 if (argv[0] === "wait") process.exit(process.env.LUVUS_STUB_GONE === "1" ? 2 : process.env.LUVUS_STUB_UNSETTLED === "1" ? 1 : 0);
 if (argv[0] === "agent" && argv[1] === "get") {
@@ -145,7 +158,10 @@ if (argv[0] === "agent" && argv[1] === "get") {
 		process.stdout.write(JSON.stringify({ error: { code: "not_found", message: "agent target not found" } }));
 		process.exit(1);
 	}
-	ok({ pane: argv[2], status: "working" });
+	// Measured against the real CLI: a fresh child is idle, and paste + Enter moves it
+	// to working within a second — which the submit reads instead of waiting on.
+	const state = join(sessionDir, argv[2] + ".state");
+	ok({ pane: argv[2], status: existsSync(state) ? readFileSync(state, "utf-8") : "idle" });
 }
 if (argv[0] === "agent" && argv[1] === "report") ok({});
 if (argv[0] === "agent" && argv[1] === "release") ok({});
@@ -407,7 +423,8 @@ await tools.delegate.execute(
 const resumeLogAfter = readFileSync(STUB_LOG, "utf-8").slice(resumeLogBefore.length);
 check(
 	"a resumed delegation submits through the host's own confirmation",
-	resumeLogAfter.includes(`agent prompt ${resumeId} the new task --wait --until working`),
+	resumeLogAfter.includes(`agent prompt ${resumeId} the new task`) &&
+		resumeLogAfter.includes(`agent keys ${resumeId} enter`),
 	resumeLogAfter.trim().split("\n").slice(0, 4).join(" | "),
 );
 
@@ -430,13 +447,18 @@ check(
 	"the failed delegation still closed its pane",
 	readFileSync(STUB_LOG, "utf-8").includes("pane close 42"),
 );
-// The unsettled delegation from the check above is still in the registry, so the
-// widget can hold more than one row — search every row, not just the first.
-const failedRow = frames
+// A settled row is drawn only beside a live one, and the widget is cleared once nothing
+// is running — so the failed row needs a delegation that stays live to be rendered at
+// all. UNSETTLED keeps the watcher from ending it, and the delegation is not awaited.
+process.env.LUVUS_STUB_UNSETTLED = "1";
+await tools.delegate.execute("verify-live-row", { agent: "fixture-bare", task: "stay", wait: false }, undefined, undefined, ctx);
+await new Promise((resolve) => setTimeout(resolve, 1500));
+const widgetLines = frames
 	.filter((frame) => frame.kind === "widget" && frame.content !== undefined)
-	.flatMap((frame) => frame.content)
-	.find((line) => /\u2039error\u203a\u2717\u2039\/error\u203a/.test(line) && line.includes("failed"));
-check("the widget shows a failed row in the error colour", failedRow !== undefined, failedRow);
+	.flatMap((frame) => frame.content);
+const failedRow = widgetLines.find((line) => /\u2039error\u203a\u2717\u2039\/error\u203a/.test(line) && line.includes("failed"));
+check("the widget shows a failed row in the error colour", failedRow !== undefined, widgetLines.join(" | "));
+delete process.env.LUVUS_STUB_UNSETTLED;
 console.log("\nbackground delegation");
 frames.length = 0;
 await deliverQueued();
@@ -633,9 +655,10 @@ check(
 	/fixture-bare-[0-9a-f]{6}\s+failed/.test(later.content[0].text),
 	later.content[0].text,
 );
-// A background delegation must not sit at "still running" once its pane is gone.
+// A background delegation whose pane is already gone must still return at once, and say
+// what it found rather than claiming a child that is not there is running.
 const bgGone = await tools.delegate.execute("verify-bg-gone", { agent: "fixture-bare", task: "bg", wait: false }, undefined, undefined, ctx);
-check("a background delegation still returns immediately", bgGone.content[0].text.includes("(running)"), bgGone.content[0].text);
+check("a background delegation returns at once with its pane gone", bgGone.content[0].text.includes("pane closed"), bgGone.content[0].text);
 await new Promise((resolve) => setTimeout(resolve, 1500));
 check(
 	"the detached watcher reports a closed pane instead of still running",
@@ -701,7 +724,9 @@ check("steer reports what it did", steered.content[0].text.includes("Interrupted
 check(
 	"steer interrupts before it prompts",
 	steerLog[0] === "agent keys fixture-bare-deadbe esc" &&
-		steerLog[1].startsWith("agent prompt fixture-bare-deadbe go left --wait --until working"),
+		steerLog[1] === "agent get fixture-bare-deadbe" &&
+		steerLog[2] === "agent prompt fixture-bare-deadbe go left" &&
+		steerLog[3] === "agent keys fixture-bare-deadbe enter",
 	steerLog.join(" | "),
 );
 
