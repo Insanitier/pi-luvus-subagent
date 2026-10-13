@@ -707,8 +707,6 @@ const COMPLETION_OUTPUT_CAP = 50 * 1024;
 /** Lines of the answer shown before the card asks for Ctrl+O. */
 const COLLAPSED_LINES = 3;
 
-type CompletionDetails = { sessionId?: string; pane?: string; status?: string };
-
 function capCompletion(text: string): string {
 	if (text.length <= COMPLETION_OUTPUT_CAP) return text;
 	const kept = text.slice(0, COMPLETION_OUTPUT_CAP);
@@ -716,25 +714,57 @@ function capCompletion(text: string): string {
 }
 
 /**
- * Draw a completion notice as a card: header plus a few lines, the rest behind
- * Ctrl+O.
+ * Completion notices, delivered as one message.
  *
- * The model still receives the whole text — packaging the display is what keeps
- * the transcript readable, and dropping the text instead would hide the answer
- * from the parent.
+ * A notice that arrives while an earlier one is still waiting to be delivered rides
+ * along with it, so a burst of children settling costs the parent one wake-up instead
+ * of one each. Identity is what says the queued message went out: `message_start`
+ * hands back the same array. The settled-and-idle check is the net under it, because a
+ * delivery discarded with Escape never starts, and nothing else would clear it.
+ */
+let pendingNotice: { type: "text"; text: string }[] | undefined;
+
+function sendNotice(pi: ExtensionAPI, text: string): void {
+	const queued = pendingNotice !== undefined;
+	pendingNotice ??= [];
+	pendingNotice.push({ type: "text", text });
+	if (queued) return;
+	pi.sendMessage(
+		{
+			customType: "luvus-subagent-completion",
+			// The answer rides along, capped; the renderer draws each part as its own
+			// header plus a few lines, so the transcript stays readable without hiding
+			// the result from the parent.
+			content: pendingNotice,
+			display: true,
+		},
+		{ deliverAs: "followUp", triggerTurn: true },
+	);
+}
+
+/**
+ * Draw a completion notice as a card: one header per child, then a few lines of its
+ * answer, the rest behind Ctrl+O.
+ *
+ * The model still receives the whole text — packaging the display is what keeps the
+ * transcript readable, and dropping the text instead would hide the answer from the
+ * parent. A header's glyph is its status, so a merged card colours every child right.
  */
 function registerCompletionRenderer(pi: ExtensionAPI): void {
-	pi.registerMessageRenderer<CompletionDetails>(
-		"luvus-subagent-completion",
-		(message, { expanded, outputPad }, theme) => {
-			const text = typeof message.content === "string" ? message.content : "";
-			const [head = "", ...rest] = text.split("\n");
+	pi.registerMessageRenderer("luvus-subagent-completion", (message, { expanded, outputPad }, theme) => {
+		const parts =
+			typeof message.content === "string"
+				? [message.content]
+				: message.content.filter((part) => part.type === "text").map((part) => part.text);
+		const box = new Box(outputPad, 1, (line) => theme.bg("customMessageBg", line));
+		for (const part of parts) {
+			const [head = "", ...rest] = part.split("\n");
 			const body = rest.filter((line) => line.trim().length > 0);
-			const box = new Box(outputPad, 1, (line) => theme.bg("customMessageBg", line));
-			box.addChild(new Text(theme.fg(message.details?.status === "failed" ? "error" : "success", head), 0, 0));
+			const color = head.startsWith("✗") ? "error" : head.startsWith("⌛") ? "muted" : "success";
+			box.addChild(new Text(theme.fg(color, head), 0, 0));
 			if (expanded) {
 				if (body.length > 0) box.addChild(new Markdown(body.join("\n"), 0, 0, getMarkdownTheme()));
-				return box;
+				continue;
 			}
 			const preview = body.slice(0, COLLAPSED_LINES);
 			if (preview.length > 0) box.addChild(new Text(theme.fg("toolOutput", preview.join("\n")), 0, 0));
@@ -747,9 +777,9 @@ function registerCompletionRenderer(pi: ExtensionAPI): void {
 					),
 				);
 			}
-			return box;
-		},
-	);
+		}
+		return box;
+	});
 }
 /**
  * Watch a background child to completion and hand its result to the parent.
@@ -804,29 +834,11 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 		const shown = result !== undefined ? capCompletion(result.text) : ended === "still running" ? "(no result was written)" : "";
 		const body = shown.length > 0 ? [header, "", shown] : [header];
 		if (line.note.length > 0) body.push("", line.note);
-		pi.sendMessage(
-			{
-				customType: "luvus-subagent-completion",
-				// The answer rides along, capped; the renderer draws it as a card so the
-				// transcript stays readable without hiding the result from the parent.
-				content: body.join("\n"),
-				details: { sessionId, pane, status: result?.status },
-				display: true,
-			},
-			{ deliverAs: "followUp", triggerTurn: true },
-		);
+		sendNotice(pi, body.join("\n"));
 	} catch (error) {
 		settleDelegation(sessionId, "failed");
 		if (isStale()) return;
-		pi.sendMessage(
-			{
-				customType: "luvus-subagent-completion",
-				content: `✗ ${agentName} (${sessionId}) — could not read its result: ${String(error)}`,
-				details: { sessionId, pane },
-				display: true,
-			},
-			{ deliverAs: "followUp", triggerTurn: true },
-		);
+		sendNotice(pi, `✗ ${agentName} (${sessionId}) — could not read its result: ${String(error)}`);
 	} finally {
 		await teardownDelegation({ pi, pane, promptFile, settled: outcome === "settled" });
 	}
@@ -1114,10 +1126,21 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	let sessionStale = false;
 	// Completion notices are pushed into the transcript; this draws them as cards.
 	registerCompletionRenderer(pi);
+	// A queued notice is cleared by identity when Pi starts delivering it, and by this
+	// net when it never does: a delivery discarded with Escape never starts.
+	pi.on("message_start", ({ message }) => {
+		if (message.role === "custom" && message.customType === "luvus-subagent-completion" && message.content === pendingNotice) {
+			pendingNotice = undefined;
+		}
+	});
+	pi.on("agent_settled", (_event, ctx) => {
+		if (ctx.isIdle()) pendingNotice = undefined;
+	});
 	entryApi = pi;
 
 	pi.on("session_shutdown", () => {
 		// The widget goes away with the session; stop the ticker and forget them.
+		pendingNotice = undefined;
 		delegations.clear();
 		stopStatusTicker();
 	});
@@ -1161,6 +1184,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_switch", () => {
+		pendingNotice = undefined;
 		delegations.clear();
 		stopStatusTicker();
 		statusUi?.setWidget(STATUS_KEY, undefined);

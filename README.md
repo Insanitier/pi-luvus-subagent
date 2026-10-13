@@ -33,7 +33,7 @@ While at least one delegation is running, a list sits above the editor with one 
 
 The child owns its pane, so a delegation is out-of-process by construction: `wait` decides only whether the parent blocks, never where the child runs. A background delegation leaves its pane open so `steer` can still reach it.
 
-Completion notices are delivered as follow-ups, never steered mid-turn, so a notice cannot land between a tool call and its result.
+Completion notices are delivered as follow-ups, never steered mid-turn, so a notice cannot land between a tool call and its result. A notice that arrives while an earlier one is still queued rides along with it, so several children settling together cost the parent one wake-up rather than one each; the card draws one header per child, coloured by the status its header already carries.
 
 A pane that is closed ends its delegation at once. A wait cannot see a state that will never arrive, so the row settles as failed instead of counting down its window — a closed pane is not a slow child. A child that ended without a finished result is reported as such — `truncated`, `aborted`, `error`, `no answer` — with the provider's own words as the answer text. Pi reports no finer cause than `stopReason`, so no cause is guessed, and the note states what happened rather than what to do about it: partial output must not read as a finished result.
 

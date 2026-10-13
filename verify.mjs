@@ -173,6 +173,17 @@ const exec = (bin, args, options = {}) =>
 	});
 
 const tools = {};
+// A notice's content is one text part per child: merging is what makes a burst of
+// children cost the parent one wake-up, so the checks read the parts, not a string.
+const noticeText = (notice) =>
+	typeof notice.content === "string" ? notice.content : (notice.content ?? []).map((part) => part.text).join("\n");
+// Registered renderers, so the card a merged notice draws can be checked too.
+const renderers = {};
+// Pi hands the queued notice back when it starts delivering it. A check that counts
+// notices has to let the previous batch go out first, or it would absorb the next one.
+const deliverQueued = async () => {
+	for (const handler of handlers.get("message_start") ?? []) await handler({ message: notices.at(-1) ?? {} }, ctx);
+};
 const notices = [];
 // Custom session entries: Pi stores them without sending them to the model, which is
 // what lets the registry survive a reload.
@@ -183,7 +194,9 @@ const pi = new Proxy(
 	{
 		exec,
 		registerTool: (definition) => (tools[definition.name] = definition),
-		sendMessage: (message, options) => notices.push({ ...message, options }),
+		registerMessageRenderer: (type, renderer) => (renderers[type] = renderer),
+		// Pi stores a custom message with role "custom"; the notice hooks read both fields.
+		sendMessage: (message, options) => notices.push({ role: "custom", ...message, options }),
 		appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
 		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 	},
@@ -345,13 +358,13 @@ check(
 // watcher: it stays watched, and it is never recorded as finished while it runs.
 await new Promise((resolve) => setTimeout(resolve, 800));
 const handedCard = notices.find(
-	(n) => n.customType === "luvus-subagent-completion" && String(n.content).includes("still running after"),
+	(n) => n.customType === "luvus-subagent-completion" && noticeText(n).includes("still running after"),
 );
-const handedName = String(handedCard?.content).match(/fixture-bare-[0-9a-f]{6}/)?.[0];
+const handedName = noticeText(handedCard ?? { content: "" }).match(/fixture-bare-[0-9a-f]{6}/)?.[0];
 check(
 	"a blocking delegation that ran out is still watched",
 	handedCard !== undefined,
-	JSON.stringify(notices.filter((n) => n.customType === "luvus-subagent-completion").map((n) => String(n.content).slice(0, 70))),
+	JSON.stringify(notices.filter((n) => n.customType === "luvus-subagent-completion").map((n) => noticeText(n).slice(0, 70))),
 );
 const handedRows = (await tools.subagent_status.execute("verify-handed", {}, undefined, undefined, ctx)).content[0].text;
 check(
@@ -414,6 +427,7 @@ const failedRow = frames
 check("the widget shows a failed row in the error colour", failedRow !== undefined, failedRow);
 console.log("\nbackground delegation");
 frames.length = 0;
+await deliverQueued();
 notices.length = 0;
 const background = await tools.delegate.execute(
 	"verify-bg",
@@ -447,7 +461,7 @@ check(
 	"the detached watcher sends the completion notice",
 	notices.length === 1 &&
 		notices[0].customType === "luvus-subagent-completion" &&
-		notices[0].content.includes("STUB_ANSWER"),
+		noticeText(notices[0]).includes("STUB_ANSWER"),
 	JSON.stringify(notices[0]?.content ?? null),
 );
 check("the detached watcher closed the pane", readFileSync(STUB_LOG, "utf-8").includes("pane close 42"));
@@ -461,6 +475,49 @@ check(
 		),
 	JSON.stringify(notices.map((notice) => notice.options)),
 );
+console.log("\nmerged notices");
+// Deliver what is queued first, the way Pi does: the same array comes back, and that
+// identity is what tells the extension the queued notice has gone out.
+await deliverQueued();
+notices.length = 0;
+const mergeA = await tools.delegate.execute("verify-merge-a", { agent: "fixture-bare", task: "say the thing", wait: false }, undefined, undefined, ctx);
+const mergeB = await tools.delegate.execute("verify-merge-b", { agent: "fixture-bare", task: "say the thing", wait: false }, undefined, undefined, ctx);
+const mergeNameA = mergeA.content[0].text.match(/fixture-bare-[0-9a-f]{6}/)?.[0];
+const mergeNameB = mergeB.content[0].text.match(/fixture-bare-[0-9a-f]{6}/)?.[0];
+await new Promise((resolve) => setTimeout(resolve, 2500));
+check(
+	"two children settling together cost one notice, not two",
+	notices.length === 1 &&
+		mergeNameA !== undefined &&
+		mergeNameB !== undefined &&
+		mergeNameA !== mergeNameB &&
+		noticeText(notices[0]).includes(mergeNameA) &&
+		noticeText(notices[0]).includes(mergeNameB),
+	`${notices.length} notice(s): ${notices.map((notice) => noticeText(notice).slice(0, 80)).join(" | ")}`
+);
+check(
+	"the merged notice carries both answers",
+	(noticeText(notices[0] ?? { content: "" }).match(/STUB_ANSWER/g) ?? []).length === 2,
+	noticeText(notices[0] ?? { content: "" }).slice(0, 200),
+);
+// The card is drawn per part: a merged notice gives each child its own header, coloured
+// by the glyph that header already carries, not one header and a wall of body text.
+const mergedCard = renderers["luvus-subagent-completion"](
+	{
+		content: [
+			{ type: "text", text: "✓ worker-a (done, 4s, worker-a-aaaaaa)\n\nanswer one" },
+			{ type: "text", text: "✗ worker-b (aborted, 9s, worker-b-bbbbbb)\n\nanswer two" },
+		],
+	},
+	{ expanded: true, outputPad: 0 },
+	theme,
+);
+const drawn = JSON.stringify(mergedCard ?? null);
+check(
+	"a merged card gives each child its own header, coloured by its own glyph",
+	drawn.includes("‹success›✓ worker-a") && drawn.includes("‹error›✗ worker-b"),
+	drawn.slice(0, 240),
+);
 console.log("\nstatus tool (the pi-task shape: pull, no bash)");
 // The registry drops settled rows whenever a new delegation starts, so by now it
 // holds the unsettled child (still working) and the background one (done).
@@ -471,7 +528,7 @@ check("status lists a done row", /fixture-bare-[0-9a-f]{6}\s+done/.test(listText
 check("status names the pane", /pane 42/.test(listText), listText);
 
 // The answer comes back for a settled delegation, parsed from its notice.
-const settledName = notices[0]?.content.match(/fixture-bare-[0-9a-f]{6}/)?.[0];
+const settledName = noticeText(notices[0] ?? { content: "" }).match(/fixture-bare-[0-9a-f]{6}/)?.[0];
 const oneRow = await tools.subagent_status.execute(
 	"verify-status-one",
 	{ sessionName: settledName },
@@ -558,8 +615,8 @@ check("a background delegation still returns immediately", bgGone.content[0].tex
 await new Promise((resolve) => setTimeout(resolve, 1500));
 check(
 	"the detached watcher reports a closed pane instead of still running",
-	notices.some((notice) => String(notice.content).includes("its pane was closed before it finished")),
-	JSON.stringify(notices.map((notice) => notice.content)),
+	notices.some((notice) => noticeText(notice).includes("its pane was closed before it finished")),
+	JSON.stringify(notices.map((notice) => noticeText(notice))),
 );
 process.env.LUVUS_STUB_GONE = "";
 // A turn that ended on an upstream error leaves a live session behind: the parent has
