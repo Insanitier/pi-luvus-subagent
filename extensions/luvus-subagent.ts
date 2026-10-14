@@ -1615,9 +1615,6 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		description:
 			"Send an additional instruction to a subagent that is already running in its Luvus pane. Set interrupt to stop its current work first; a background delegation keeps its pane open for this.",
 		promptSnippet: "Send an additional instruction to a running subagent",
-		promptGuidelines: [
-			"Use steer to redirect a running subagent mid-run instead of waiting for it to finish and delegating the correction again.",
-		],
 		parameters: Type.Object({
 			sessionName: Type.String({ description: "Subagent session name, as returned by delegate" }),
 			message: Type.String({ description: "Instruction to send" }),
@@ -1662,9 +1659,6 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		description:
 			"List this session's subagent delegations and their state. With wait: true, block until the named delegation settles (or timeout_ms passes) and return its answer.",
 		promptSnippet: "Check on subagents this session delegated",
-		promptGuidelines: [
-			"A background delegation's answer arrives on its own; ask for it with subagent_status only when you need it sooner.",
-		],
 		parameters: Type.Object({
 			sessionName: Type.Optional(
 				Type.String({

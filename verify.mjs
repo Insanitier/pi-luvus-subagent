@@ -762,14 +762,12 @@ check(
 	tools.delegate.description,
 );
 check(
-	"steer and subagent_status each carry their own rule",
-	(tools.steer.promptGuidelines ?? []).length === 1 && (tools.subagent_status.promptGuidelines ?? []).length === 1,
+	"steer and subagent_status carry no guidelines: their descriptions do the work",
+	(tools.steer.promptGuidelines ?? []).length === 0 && (tools.subagent_status.promptGuidelines ?? []).length === 0,
 );
 check(
 	"guidelines are bare rules: the renderer adds the dash",
-	["delegate", "steer", "subagent_status"].every((name) =>
-		(tools[name].promptGuidelines ?? []).every((rule) => !rule.startsWith("- ")),
-	),
+	(tools.delegate.promptGuidelines ?? []).every((rule) => !rule.startsWith("- ")),
 );
 
 console.log("\nresume");
