@@ -237,7 +237,9 @@ const ctx = {
 };
 
 const failures = [];
+let checks = 0;
 const check = (name, condition, detail = "") => {
+	checks++;
 	if (condition) console.log(`  \u2705 ${name}`);
 	else {
 		console.log(`  \u274c ${name}${detail ? `\n       ${detail}` : ""}`);
@@ -906,5 +908,8 @@ check(
 );
 check("the reporter releases its lease on shutdown", /agent release 77/.test(reporterLog), reporterLog);
 
-console.log(`\n${failures.length === 0 ? "PASS" : `FAIL (${failures.length})`}: ${failures.join(", ")}`);
+console.log(
+	`\n${failures.length === 0 ? "PASS" : `FAIL (${failures.length})`}: ${checks - failures.length}/${checks} checks` +
+		(failures.length > 0 ? `\n  ${failures.join("\n  ")}` : ""),
+);
 process.exit(failures.length === 0 ? 0 : 1);
