@@ -753,10 +753,13 @@ check(
 	sections.subagent_agents,
 );
 check("a stale catalogue is replaced, not added to", !sections.subagent_agents.includes("stale"), sections.subagent_agents);
+const policy = tools.delegate.promptGuidelines ?? [];
 check(
-	"delegate carries the delegation policy",
-	(tools.delegate.promptGuidelines ?? []).some((rule) => rule.includes("When to delegate")),
-	JSON.stringify(tools.delegate.promptGuidelines),
+	"delegate carries the delegation policy: three rules, when-to and don't-duplicate still there",
+	policy.length === 3 &&
+		policy.some((rule) => rule.includes("Reach for a subagent")) &&
+		policy.some((rule) => rule.includes("wait for it")),
+	JSON.stringify(policy),
 );
 check(
 	"delegate points at subagent_status for an answer that has not arrived",

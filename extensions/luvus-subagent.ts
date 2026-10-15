@@ -1419,13 +1419,13 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			"Delegate a task to a subagent running in a visible Luvus pane. wait: false returns as soon as the pane is up and the answer arrives later as a completion message; ask for it sooner with subagent_status. Use dry_run to inspect the resolved launch plan without starting anything.",
 		promptSnippet: "Delegate a task to a subagent running in a visible Luvus pane",
 		// The delegation policy, tuned from the subagents fork: when to reach for an
-		// agent, when to search directly instead, and what the answer means.
+		// agent, when to search directly instead, and what the answer means. Three rules,
+		// not five: the catalogue already says which agent fits, the mechanism is in the
+		// description, and a rule that only restates either one is not worth its tokens.
 		promptGuidelines: [
-			"When to delegate — reach for this when the task matches an available subagent, when you have independent work to run in parallel, or when answering would mean reading across several files. Delegate it and you keep the conclusion, not the file dumps.",
-			"For a single-fact lookup where you already know the file, symbol, or value, search directly. Once you have delegated an investigation, do NOT also run it yourself — wait for the result.",
-			"Provide clear, detailed prompts so the subagent can work autonomously.",
-			"A subagent's answer comes back as text and is also shown to the user — relay what matters instead of repeating it.",
-			"Never fabricate or predict a pending subagent's result. If the user asks before it arrives, say it is still running.",
+			"Reach for a subagent when answering would mean reading across several files, or when you have independent work to run in parallel — you keep the conclusion, not the file dumps.",
+			"For a single fact you can already locate, search directly; once a delegation is running, do not investigate the same thing yourself — wait for it.",
+			"Give the subagent a self-contained task, and relay what matters from its answer instead of repeating it; never predict a pending result — if the user asks first, say it is still running.",
 		],
 		parameters: Type.Object({
 			agent: Type.String({ description: "Agent name, from the subagents listed in your context" }),
