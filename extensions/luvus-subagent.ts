@@ -545,16 +545,16 @@ const PANE_CLOSE_TIMEOUT_MS = 15_000;
 const KEYSTROKE_TIMEOUT_MS = 15_000;
 /** How long `agent prompt` gets to paste the task into the child's editor. */
 const PROMPT_SUBMIT_TIMEOUT_MS = 30_000;
-/** How long one read of a child's state gets. */
-const AGENT_STATUS_TIMEOUT_MS = 10_000;
-
-/** How often that read is repeated while a fresh child decides to start. */
+/** How often the child's transcript is read while it decides to take the task. */
 const START_POLL_MS = 1_000;
+
+/** How much of a task is matched against the child's transcript. */
+const TASK_MARK_CHARS = 64;
 
 /** How much of a CLI's stderr is quoted back when its reply is unreadable. */
 const STDERR_TAIL_CHARS = 200;
 
-/** How long a fresh child gets to leave `idle` before its task counts as unstarted. Measured: a second. */
+/** How long a fresh child gets to write the task into its transcript. Measured: a second. */
 const START_CONFIRM_SECONDS = 15;
 
 /** How long a steer to a busy child waits for the host to see it picked the message up. */
@@ -601,8 +601,18 @@ async function callLuvus(pi: ExtensionAPI, args: string[], timeoutMs: number): P
 	return { result: envelope.result ?? {}, code: exec.code };
 }
 
+/**
+ * What `agent start` says about the pane it just brought up.
+ *
+ * The status rides along because this reply is the only reading taken while the agent
+ * is known to be ready: Luvus answers it once readiness is established, and its own
+ * guidance is to accept it instead of looking the state up again (see
+ * `submitAndConfirm`).
+ */
+type Launch = { pane: string; status: string | undefined };
+
 /** A child pane's id, or "" when the CLI named none. */
-async function startChild(pi: ExtensionAPI, sessionName: string, args: string[]): Promise<string> {
+async function startChild(pi: ExtensionAPI, sessionName: string, args: string[]): Promise<Launch> {
 	const started = await callLuvus(
 		pi,
 		// `--auto` lets Luvus pick the split direction, so a fourth child can land below
@@ -610,7 +620,10 @@ async function startChild(pi: ExtensionAPI, sessionName: string, args: string[])
 		["agent", "start", sessionName, "--kind", "pi", "--auto", "--timeout", String(READY_TIMEOUT_SECONDS), "--", ...args],
 		AGENT_START_TIMEOUT_MS,
 	);
-	return typeof started.result.pane === "string" ? started.result.pane : "";
+	return {
+		pane: typeof started.result.pane === "string" ? started.result.pane : "",
+		status: typeof started.result.status === "string" ? started.result.status : undefined,
+	};
 }
 
 async function pressKey(pi: ExtensionAPI, sessionName: string, key: string): Promise<void> {
@@ -1253,58 +1266,90 @@ async function launchChild(
 	sessionName: string,
 	plan: LaunchPlan,
 	ui: ExtensionUIContext | undefined,
-): Promise<string> {
-	const pane = await startChild(pi, sessionName, plan.args);
+): Promise<Launch> {
+	const launch = await startChild(pi, sessionName, plan.args);
 	// Tracked from the launch, so the duration covers the whole delegation.
 	// No UI in print or JSON mode; the widget is simply not drawn there.
-	trackDelegation(sessionName, pane, ui);
-	return pane;
+	trackDelegation(sessionName, launch.pane, ui);
+	return launch;
 }
 
 /**
- * The host's own view of a child's state, or undefined when it cannot be read (a pane
- * that is gone answers with an error envelope, which `callLuvus` throws on).
+ * Whether the child's own transcript holds this task as a user message.
+ *
+ * A status describes the pane; this describes *this* text. Pi writes the user message
+ * when it takes the task over, so the transcript is the one place where "my message
+ * arrived" is a fact instead of an inference.
  */
-async function agentStatus(pi: ExtensionAPI, sessionName: string): Promise<string | undefined> {
+function taskInTranscript(sessionId: string, task: string): boolean {
+	const file = sessionFileFor(sessionId);
+	if (file === undefined) return false;
+	let text: string;
 	try {
-		const reply = await callLuvus(pi, ["agent", "get", sessionName], AGENT_STATUS_TIMEOUT_MS);
-		return typeof reply.result.status === "string" ? reply.result.status : undefined;
+		text = readFileSync(file, "utf-8");
 	} catch {
-		return undefined;
+		return false;
 	}
+	// Enough of the task to be unmistakable, short enough to survive any wrapping.
+	const mark = task.slice(0, TASK_MARK_CHARS);
+	for (const line of text.split("\n")) {
+		if (!line.includes("\"user\"")) continue;
+		let record: { message?: { role?: string; content?: { type?: string; text?: string }[] } };
+		try {
+			record = JSON.parse(line) as typeof record;
+		} catch {
+			// The child is appending right now, so its last line can be half-written.
+			continue;
+		}
+		const message = record.message;
+		if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+		const said = message.content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("");
+		if (said.includes(mark)) return true;
+	}
+	return false;
 }
 
 /**
- * Hand a task to a child and let the host say whether it started.
+ * Hand a task to a child and let its own transcript say whether it took it.
  *
  * Two steps, because one is not enough: `agent prompt` pastes the text, and a long
  * multi-line paste is *not* submitted by it — measured against the real CLI, where a
  * 12-line paste sat in the child's editor until a separate `agent keys <target> enter`.
  *
- * The evidence is the host's own `status` field, read rather than waited on: `wait
- * agent-status` only sees transitions that begin *after* it starts, and by then the paste
- * and Enter have already happened, so it can only ever time out. Measured: a fresh child
- * is `idle`, and paste + Enter moves it to `working` within a second. A child that was
- * already busy cannot be judged this way — its status proves nothing about *this*
- * message — so the answer there is "queued, not confirmed": true, and not a failure.
+ * The evidence is the child's transcript, not its status. Luvus answers `agent start`
+ * with the state it saw once the pane was ready, and its guidance is to accept that
+ * "without another status lookup": a second lookup lands while the pane is still coming
+ * up, where the answer is a guess read off the screen (`authority: command_fallback`) or
+ * not reported yet, and neither says anything about *this* message. So the launch reply
+ * is the baseline, and the confirmation is the user line the child writes when it picks
+ * the task up.
+ *
+ * A pane that reported itself busy at launch is the one case where nothing the child
+ * does afterwards is evidence about this message, so it is handed back unconfirmed —
+ * as is a handover the host refused, which sent nothing at all.
  */
 async function submitAndConfirm(
 	pi: ExtensionAPI,
 	sessionName: string,
 	task: string,
 	seconds: number,
-): Promise<"taken" | "queued"> {
-	// A busy child is unreadable from here: its status is already working, so nothing it
-	// does afterwards is evidence about this message.
-	const before = await agentStatus(pi, sessionName);
+	launched: string | undefined,
+): Promise<"taken" | "queued" | "unsent"> {
+	const busy =
+		launched !== undefined && launched !== "idle" && launched !== "done" && launched !== "unknown";
 	// Paste, then submit: a long paste leaves the text sitting in the editor.
-	await callLuvus(pi, ["agent", "prompt", sessionName, task], PROMPT_SUBMIT_TIMEOUT_MS);
-	await pressKey(pi, sessionName, "enter");
-	if (before !== "idle") return "queued";
-	// A fresh child is idle, so any other status means it took what we just sent.
+	try {
+		await callLuvus(pi, ["agent", "prompt", sessionName, task], PROMPT_SUBMIT_TIMEOUT_MS);
+		await pressKey(pi, sessionName, "enter");
+	} catch {
+		// A pane that went away mid-hand-over refuses the paste; the caller asks whether it
+		// is gone and reports that instead of a task that was never sent.
+		return "unsent";
+	}
+	if (busy) return "queued";
 	const deadline = Date.now() + seconds * 1000;
 	while (Date.now() < deadline) {
-		if ((await agentStatus(pi, sessionName)) !== "idle") return "taken";
+		if (taskInTranscript(sessionName, task)) return "taken";
 		await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
 	}
 	return "queued";
@@ -1630,7 +1675,8 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			if (promptFile !== undefined) writePromptFile(promptFile, agent.systemPrompt);
 
 			// 1. Launch the child in its own pane; the task follows as a message.
-			const pane = await launchChild(pi, sessionName, plan, ctx.hasUI ? ctx.ui : undefined);
+			const launch = await launchChild(pi, sessionName, plan, ctx.hasUI ? ctx.ui : undefined);
+			const pane = launch.pane;
 			pi.appendEntry(DELEGATION_ENTRY, {
 				sessionName,
 				agent: agent.name,
@@ -1645,8 +1691,26 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			let settled = false;
 			let outcome: SettleOutcome | undefined;
 			try {
-				// 2. Hand the task over, and let the host say whether the child started.
-				const started = await submitAndConfirm(pi, sessionName, params.task, START_CONFIRM_SECONDS);
+				// 2. Hand the task over, and let the child's own transcript say whether it took it.
+				const started = await submitAndConfirm(pi, sessionName, params.task, START_CONFIRM_SECONDS, launch.status);
+				if (started === "unsent") {
+					// Nothing reached the child, so this is a failure however the pane looks.
+					settleDelegation(sessionName, "failed");
+					settled = true;
+					if (await paneIsGone(pi, pane)) {
+						markReported(sessionName);
+						return blockingResult(agent.name, "gone", undefined, []);
+					}
+					return {
+						content: [
+							{
+								type: "text",
+								text: `${sessionName} could not be handed the task: the host refused the paste (its pane is still there), so nothing was sent and nothing is running.`,
+							},
+						],
+						isError: true,
+					};
+				}
 				if (started === "queued") {
 					// A pane that is already gone is not an unstarted task: report it the way every
 					// other closed pane is, not as a countdown that never ran.
@@ -1656,10 +1720,21 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						markReported(sessionName);
 						return blockingResult(agent.name, "gone", undefined, []);
 					}
-					// Waiting on a child that never started would block for WAIT_SECONDS.
-					settleDelegation(sessionName, "failed");
-					settled = true;
-					const unpicked = `${sessionName} never started working: it stayed idle for ${START_CONFIRM_SECONDS}s after the task was pasted and submitted. Nothing is running; its pane is closed.`;
+					// Nothing proved the child took the task, but the prompt was pasted and
+					// submitted, so it can still be picked up — and a second paste into the same
+					// pane would send it twice. So this is unconfirmed, not failed: the record
+					// stays `working` (steer and status still apply), the pane is left open, and
+					// the watcher still delivers whatever the child eventually says.
+					void deliverWhenSettled({
+						pi,
+						pane,
+						sessionId: sessionName,
+						agentName: agent.name,
+						promptFile,
+						isStale: () => sessionStale,
+					});
+					const reported = launch.status === undefined ? "no status" : `"${launch.status}"`;
+					const unpicked = `${sessionName} was not confirmed as started: ${START_CONFIRM_SECONDS}s after the task was pasted and submitted, its transcript still held no such message (the host reported ${reported} when the pane came up). It may still be picked up, so check it or steer it instead of sending the task again; its pane is left open, and the answer arrives as a notice if the child produces one.`;
 					return { content: [{ type: "text", text: unpicked }], isError: true };
 				}
 				if (wait) {
@@ -1748,14 +1823,17 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					await pressKey(pi, params.sessionName, "esc");
 				}
 				const how = params.interrupt === true ? "Interrupted, then" : "Sent to";
-				const verdict = await submitAndConfirm(pi, params.sessionName, params.message, STEER_CONFIRM_SECONDS);
-				// Two facts, and only two: the host took the message, and — for a child that was
-				// idle — whether it started. A busy child proves nothing about this message, so
-				// "queued" is the honest answer there, not a failure.
+				// A steer has no launch reply to read: the child is normally already working, which
+				// is exactly when a status proves nothing. Its transcript is the evidence instead.
+				const verdict = await submitAndConfirm(pi, params.sessionName, params.message, STEER_CONFIRM_SECONDS, undefined);
+				// Three facts, and only three: the child wrote the message down, the host refused it,
+				// or it was accepted and the child has not written it down yet.
 				const text =
 					verdict === "taken"
 						? `${how} ${params.sessionName}, and it is working.`
-						: `${how} ${params.sessionName} — queued; the host took the message, but pickup is not confirmed.`;
+						: verdict === "unsent"
+							? `${how} ${params.sessionName} — nothing was sent: the host refused the message.`
+							: `${how} ${params.sessionName} — queued; the host took the message, but pickup is not confirmed.`;
 				return { content: [{ type: "text", text }] };
 			} catch (error) {
 				return {

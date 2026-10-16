@@ -114,8 +114,19 @@ const ok = (result) => { process.stdout.write(JSON.stringify({ result })); proce
 const sessionDir = join(process.env.HOME, ".pi", "agent", "subagent-sessions");
 if (argv[0] === "agent" && argv[1] === "start") {
 	// A fresh child is idle, whatever a previous delegation under this name left behind.
-	writeFileSync(join(sessionDir, argv[2] + ".state"), "idle");
-	ok({ pane: "42" });
+	// ready/status are what the real CLI answers once the pane is up, and that reply is
+	// the only state the parent may read: asking again lands while the pane is still
+	// starting, where Luvus' answer is a guess read off the screen.
+	// A name of busy-pane… models a pane that already has a child working in it.
+	const busy = argv[2].includes("busy-pane");
+	writeFileSync(join(sessionDir, argv[2] + ".state"), busy ? "working" : "idle");
+	ok({ pane: "42", ready: true, status: busy ? "working" : "idle" });
+}
+if (process.env.LUVUS_STUB_GONE === "1" && argv[0] === "agent" && (argv[1] === "prompt" || argv[1] === "keys")) {
+	// A pane that is gone refuses the paste the way the real CLI does, instead of quietly
+	// accepting text nothing can receive.
+	process.stdout.write(JSON.stringify({ error: { code: "not_found", message: "agent target not found" } }));
+	process.exit(1);
 }
 if (argv[0] === "agent" && argv[1] === "prompt") {
 	// Pasting is not submitting: Luvus puts the text in the child's input box, and the
@@ -327,6 +338,7 @@ const promptFilesBefore = new Set(readdirSync(PROMPT_DIR));
 
 console.log("\nend-to-end delegation against the stub CLI");
 frames.length = 0;
+const callLogBefore = readFileSync(STUB_LOG, "utf-8").length;
 const result = await tools.delegate.execute(
 	"verify-call",
 	{ agent: "fixture-bare", task: "say the thing" },
@@ -337,6 +349,17 @@ const result = await tools.delegate.execute(
 const text = result.content[0].text;
 check("tool result carries the child's answer", text.includes("STUB_ANSWER"), text.slice(0, 120));
 check("tool result reports the agent and status", text.startsWith("fixture-bare (done):"));
+// The launch reply already carried `ready` and `status`, so nothing may look the child's
+// state up again: a second lookup is what Luvus' guidance warns against, and what used to
+// decide a delegation had not started before the child could even finish booting.
+const callLog = readFileSync(STUB_LOG, "utf-8").slice(callLogBefore).trim().split("\n");
+check(
+	"the launch reply is the only status read",
+	callLog[0].startsWith("agent start ") &&
+		callLog.some((line) => line.startsWith("agent prompt ")) &&
+		!callLog.some((line) => line.startsWith("agent get ")),
+	callLog.join(" | "),
+);
 
 const widgetFrames = frames.filter((frame) => frame.kind === "widget" && frame.content !== undefined);
 const workingFrame = widgetFrames.find((frame) => frame.content.some((line) => line.includes("working")));
@@ -465,9 +488,14 @@ check(
 	resumeLogAfter.trim().split("\n").slice(0, 4).join(" | "),
 );
 
-// The submit loop is SUBMIT_ATTEMPTS x SUBMIT_PROBE_MS by design, so this one
-// check is the slow part of the suite (~20s).
+// The submit loop is START_CONFIRM_SECONDS by design, so this one check is the slow part
+// of the suite (~15s). The watchers of earlier background delegations settle instantly in
+// this stub and close their panes, and every stub pane is 42, so they are held off while
+// this window is measured: the claim is about what *this* delegation does, not about an
+// id it shares with them.
+process.env.LUVUS_STUB_UNSETTLED = "1";
 frames.length = 0;
+const unpickedLogStart = readFileSync(STUB_LOG, "utf-8").length;
 const unpicked = await tools.delegate.execute(
 	"verify-unpicked",
 	{ agent: "fixture-bare", task: "NEVER_PICKED" },
@@ -476,14 +504,63 @@ const unpicked = await tools.delegate.execute(
 	ctx,
 );
 check(
-	"a task the child never took is an error that says so",
-	unpicked.isError === true && unpicked.content[0].text.includes("never started working"),
+	"a task the child never took is unconfirmed, and says what the host reported",
+	unpicked.isError === true &&
+		unpicked.content[0].text.includes("was not confirmed as started") &&
+		unpicked.content[0].text.includes('"idle"') &&
+		unpicked.content[0].text.includes("steer it instead of sending the task again"),
 	unpicked.content[0].text,
 );
 check(
-	"the failed delegation still closed its pane",
-	readFileSync(STUB_LOG, "utf-8").includes("pane close 42"),
+	"a task that was never taken leaves its pane open",
+	!readFileSync(STUB_LOG, "utf-8").slice(unpickedLogStart).includes("pane close"),
+	readFileSync(STUB_LOG, "utf-8").slice(unpickedLogStart),
 );
+delete process.env.LUVUS_STUB_UNSETTLED;
+const unpickedName = unpicked.content[0].text.match(/fixture-bare-[0-9a-f]{6}/)?.[0];const unpickedRow = (
+	await tools.subagent_status.execute("verify-unpicked-row", { sessionName: unpickedName }, undefined, undefined, ctx)
+).content[0].text;
+check(
+	"an unconfirmed task stays steerable instead of being recorded as failed",
+	/working/.test(unpickedRow) && !/failed/.test(unpickedRow),
+	unpickedRow,
+);
+// A pane that came up already working proves nothing about the message just sent, and the
+// guidance is not to kill it over that: when it still had a child in it, the handover is
+// handed back unconfirmed — at once, since the launch reply already said as much.
+const busyId = "busy-pane-fixture";
+writeFileSync(
+	join(resumeDir, `1970-01-01T00-00-00-000Z_${busyId}.jsonl`),
+	JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "an older task" }] } }),
+);
+process.env.LUVUS_STUB_UNSETTLED = "1";
+const busyLogStart = readFileSync(STUB_LOG, "utf-8").length;
+const busySentAt = Date.now();
+const busyStarted = await tools.delegate.execute(
+	"verify-busy-pane",
+	{ agent: "fixture-bare", task: "a new task", resume: busyId },
+	undefined,
+	undefined,
+	ctx,
+);
+delete process.env.LUVUS_STUB_UNSETTLED;
+check(
+	"a pane that was already working is handed back unconfirmed, and not killed",
+	busyStarted.isError === true &&
+		busyStarted.content[0].text.includes('"working"') &&
+		!readFileSync(STUB_LOG, "utf-8").slice(busyLogStart).includes("pane close"),
+	busyStarted.content[0].text,
+);
+check(
+	"an already-working pane is not waited on: the launch reply settles it",
+	Date.now() - busySentAt < 10_000,
+	`${Date.now() - busySentAt}ms`,
+);
+// A pane that closed is a real failure, and the row the widget colours has to come from
+// one: an unconfirmed start is no longer recorded as a failure.
+process.env.LUVUS_STUB_GONE = "1";
+await tools.delegate.execute("verify-widget-failed", { agent: "fixture-bare", task: "go away" }, undefined, undefined, ctx);
+delete process.env.LUVUS_STUB_GONE;
 // A settled row is drawn only beside a live one, and the widget is cleared once nothing
 // is running — so the failed row needs a delegation that stays live to be rendered at
 // all. UNSETTLED keeps the watcher from ending it, and the delegation is not awaited.
@@ -765,10 +842,26 @@ check("steer reports what it did", steered.content[0].text.includes("Interrupted
 check(
 	"steer interrupts before it prompts",
 	steerLog[0] === "agent keys fixture-bare-deadbe esc" &&
-		steerLog[1] === "agent get fixture-bare-deadbe" &&
-		steerLog[2] === "agent prompt fixture-bare-deadbe go left" &&
-		steerLog[3] === "agent keys fixture-bare-deadbe enter",
+		steerLog[1] === "agent prompt fixture-bare-deadbe go left" &&
+		steerLog[2] === "agent keys fixture-bare-deadbe enter" &&
+		!steerLog.some((line) => line.startsWith("agent get ")),
 	steerLog.join(" | "),
+);
+// A steer has no launch reply to read, so a refused paste is its own answer: nothing was
+// sent, and saying so is better than reporting a pickup that cannot be confirmed.
+process.env.LUVUS_STUB_GONE = "1";
+const refusedSteer = await tools.steer.execute(
+	"verify-steer-refused",
+	{ sessionName: "fixture-bare-deadbe", message: "go right" },
+	undefined,
+	undefined,
+	ctx,
+);
+delete process.env.LUVUS_STUB_GONE;
+check(
+	"a steer the host refused says nothing was sent",
+	refusedSteer.content[0].text.includes("nothing was sent"),
+	refusedSteer.content[0].text,
 );
 
 const left = readdirSync(PROMPT_DIR).filter((name) => !before.has(name));
@@ -1010,13 +1103,27 @@ const fire = async (event, ctx = sessionCtx) => {
 await fire("session_start");
 await fire("agent_start");
 await fire("agent_settled");
+// The reference integration's guard: a settlement that left the session busy is not the
+// end of a turn, so it must not publish one.
+await fire("agent_settled", { ...sessionCtx, isIdle: () => false });
+await fire("ui_prompt_start");
+await fire("ui_prompt_end");
 await fire("session_shutdown");
 const reporterLog = readFileSync(STUB_LOG, "utf-8").slice(reporterLogStart);
-check("the reporter announces idle when its session starts", /agent report 77 .*--status idle/.test(reporterLog), reporterLog);
+// This pane's reports only: the reporter was installed once before, for the pane the
+// earlier sections ran with, and its reports sit in the same log.
+const reportedStates = [...reporterLog.matchAll(/agent report 77 .*?--status (\w+)/g)].map((match) => match[1]);
+check("the reporter announces idle when its session starts", reportedStates[0] === "idle", reportedStates.join(","));
 check(
-	"the reporter reports working, then done",
-	/--status working/.test(reporterLog) && /--status done/.test(reporterLog),
-	reporterLog,
+	"the reporter reports the turn as working, and its end as done once",
+	// One settlement reported `done`; the one that left the session busy reported nothing.
+	reportedStates.slice(0, 3).join(",") === "idle,working,done",
+	reportedStates.join(","),
+);
+check(
+	"a blocked dialog outranks the turn, and the state it rests in is idle, not done",
+	reportedStates.slice(3).join(",") === "blocked,idle",
+	reportedStates.join(","),
 );
 check("the reporter releases its lease on shutdown", /agent release 77/.test(reporterLog), reporterLog);
 
