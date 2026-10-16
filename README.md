@@ -21,9 +21,9 @@ The agents that resolve are also listed in the parent's system prompt, rebuilt e
 
 | Tool | What it does |
 | --- | --- |
-| `delegate` | Start an agent in a Luvus pane. `wait: true` (the default) blocks until it settles and returns its answer; a child that outlives that wait is handed to the same watcher a background delegation uses, so its answer still arrives and its pane is still closed. `wait: false` returns as soon as the pane is up and the answer arrives later as a completion message. `resume` continues a conversation this session already ran, or one named by child session id; pass `false` (or omit it) to start a fresh delegation. `dry_run: true` prints the resolved launch plan without starting anything. |
+| `delegate` | Start an agent in a Luvus pane. `wait: true` (the default) blocks until it settles and returns its answer; a child that outlives that wait is handed to the same watcher a background delegation uses, so its answer still arrives — as a completion message — and its pane is still closed. `wait: false` returns as soon as the pane is up and the answer arrives later as a completion message that wakes the parent. `resume` continues a conversation this session already ran, or one named by child session id; pass `false` (or omit it) to start a fresh delegation. `dry_run: true` prints the resolved launch plan without starting anything. |
 | `steer` | Send another instruction to a running subagent. `interrupt: true` presses Esc first. |
-| `subagent_status` | List this session's delegations — name, state, duration, pane — or with `wait: true` block until one settles and return its answer. |
+| `subagent_status` | List this session's delegations — name, state, duration, pane; naming one also returns its answer, once that delegation is over. |
 
 ## Status widget
 
@@ -32,6 +32,8 @@ While at least one delegation is running, a list sits above the editor with one 
 ## Design
 
 The child owns its pane, so a delegation is out-of-process by construction: `wait` decides only whether the parent blocks, never where the child runs. A background delegation leaves its pane open so `steer` can still reach it.
+
+An answer is handed over once, and only once the delegation is over. A child that outlived a blocking wait is still working, so the terminal turn its session file already holds is provisional — it can be superseded before the child is done — and the result carries the wait's own note instead of that text. Waiting belongs to `delegate`, in one window that is the delegation's own; `subagent_status` is a read and takes no window at all, because a window the model sets is a poll loop by construction: the model cannot know how long a child will run, so it picks a number, the number expires, and it asks again. The answer arrives on the completion notice.
 
 Completion notices are steered, never queued as follow-ups: while the parent is streaming, Pi delivers a steer after the current turn's tool calls and before the next model call, so the notice reaches a parent that can still act on it — and it cannot land between a tool call and its result. When the parent is idle the mode makes no difference: the notice starts a run either way. A notice that arrives while an earlier one is still queued rides along with it, so several children settling together cost the parent one wake-up rather than one each; the card draws one header per child, coloured by the status its header already carries.
 

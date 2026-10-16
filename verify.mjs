@@ -379,6 +379,15 @@ check(
 	unsettled.content[0].text,
 );
 check(
+	"a wait that ran out hands over no provisional answer",
+	// The stub wrote STUB_ANSWER into the child's session file when it picked the task
+	// up, so a read of that file finds one. It is a turn that can still be superseded,
+	// not this delegation's result — handing it over here is what made one answer
+	// arrive twice: this tool result, then the notice pushed at the real settle.
+	!unsettled.content[0].text.includes("STUB_ANSWER"),
+	unsettled.content[0].text,
+);
+check(
 	"an unsettled child keeps its pane",
 	// The probe that ends a wait also logs, so this asks what the delegation did instead
 	// of what it logged last: it waited, and it never closed the pane afterwards.
@@ -601,9 +610,11 @@ check(
 	noSuch.content[0].text,
 );
 
-// The wait below needs a child that does settle, so the stub's wait answers again.
-process.env.LUVUS_STUB_UNSETTLED = "";
-// The point of the tool: waiting for a child without spawning a bash command.
+// A named read is a read: it hands an answer over only once that delegation is over.
+// The stub keeps this child running while its session file already holds a terminal
+// turn, which is the trap — a provisional turn is not the delegation's result, and
+// handing it over is what made one answer arrive twice: this read, then the notice
+// pushed when the child really settled.
 const bgAgain = await tools.delegate.execute(
 	"verify-bg3",
 	{ agent: "fixture-bare", task: "say the thing", wait: false },
@@ -612,18 +623,20 @@ const bgAgain = await tools.delegate.execute(
 	ctx,
 );
 const bgName = bgAgain.content[0].text.match(/fixture-bare-[0-9a-f]{6}/)?.[0];
-const waited = await tools.subagent_status.execute(
-	"verify-status-wait",
-	{ sessionName: bgName, wait: true, timeout_ms: 5000 },
+await new Promise((resolve) => setTimeout(resolve, 800));
+const liveRead = await tools.subagent_status.execute(
+	"verify-status-live-read",
+	{ sessionName: bgName },
 	undefined,
 	undefined,
 	ctx,
 );
-check("status can wait for a named delegation", /done/.test(waited.content[0].text), waited.content[0].text);
 check(
-	"the wait went through the extension, not a bash tool",
-	readFileSync(STUB_LOG, "utf-8").includes("wait agent-status 42"),
+	"a read of a still-running delegation returns its row and no answer",
+	/working/.test(liveRead.content[0].text) && !liveRead.content[0].text.includes("STUB_ANSWER"),
+	liveRead.content[0].text,
 );
+process.env.LUVUS_STUB_UNSETTLED = "";
 
 console.log("\ngone pane and transient errors");
 // A closed pane is not a timeout: nothing will ever report for it, so the delegation
@@ -762,9 +775,15 @@ check(
 	JSON.stringify(policy),
 );
 check(
-	"delegate points at subagent_status for an answer that has not arrived",
-	tools.delegate.description.includes("subagent_status"),
+	"delegate does not advertise polling: the answer arrives as a notice that wakes the parent",
+	!tools.delegate.description.includes("subagent_status") && tools.delegate.description.includes("wakes you"),
 	tools.delegate.description,
+);
+check(
+	"subagent_status takes no wait window: a model-set window is a poll loop",
+	tools.subagent_status.parameters.properties.wait === undefined &&
+		tools.subagent_status.parameters.properties.timeout_ms === undefined,
+	JSON.stringify(Object.keys(tools.subagent_status.parameters.properties ?? {})),
 );
 check(
 	"steer and subagent_status carry no guidelines: their descriptions do the work",

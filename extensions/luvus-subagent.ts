@@ -528,17 +528,17 @@ async function paneIsGone(pi: ExtensionAPI, pane: string): Promise<boolean> {
 /**
  * How a child ended: settled, still running, or its pane gone.
  *
- * `seconds` defaults to the window a blocking delegation uses; the status tool
- * passes its own, so asking about a child is never tied to that constant. Luvus
+ * The window is the blocking delegation's own and is not the caller's to shorten: a
+ * wait that returns before the child is done is what a poll loop is made of. Luvus
  * reports a closed pane and an expired wait with the same exit code and no JSON,
  * so a non-zero result asks the pane itself — a closed pane answers at once, and
  * reading that as "still running" is what leaves a parent counting for nothing.
  */
-async function waitForSettle(pi: ExtensionAPI, pane: string, seconds = WAIT_SECONDS): Promise<SettleOutcome> {
+async function waitForSettle(pi: ExtensionAPI, pane: string): Promise<SettleOutcome> {
 	const done = await callLuvus(
 		pi,
-		["wait", "agent-status", pane, "--status", "done", "--timeout", String(seconds)],
-		(seconds + 30) * 1000,
+		["wait", "agent-status", pane, "--status", "done", "--timeout", String(WAIT_SECONDS)],
+		(WAIT_SECONDS + 30) * 1000,
 	);
 	if (done.code === 0) return "settled";
 	return (await paneIsGone(pi, pane)) ? "gone" : "timeout";
@@ -710,14 +710,18 @@ function settledState(outcome: SettleOutcome | undefined, result: ChildResult | 
 }
 
 /**
- * The answer text for a delegation, or the placeholder when there is none.
+ * The answer text a result may carry, or "" when there is none to hand over.
  *
- * A missing answer only needs saying while the child may still produce one: when the
- * outcome's note already explains why there is none, the placeholder is noise.
+ * A child that outlived its wait is still working, and a terminal turn its session file
+ * already holds is provisional — it can be superseded by a newer one before the child is
+ * done. Handing it over is what made one answer arrive twice: here, and again in the
+ * notice the watcher pushes when the child really settles. The outcome's own note says
+ * the child is still running, so the placeholder that used to stand in for the answer is
+ * noise; and the window a caller spends waiting is never the model's to shorten.
  */
 function shownResult(result: ChildResult | undefined, ended: ChildOutcome): string {
-	if (result !== undefined) return capCompletion(result.text);
-	return ended === "still running" ? "(no result was written)" : "";
+	if (ended === "still running" || result === undefined) return "";
+	return capCompletion(result.text);
 }
 
 /**
@@ -1416,7 +1420,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		name: "delegate",
 		label: "Subagent",
 		description:
-			"Delegate a task to a subagent running in a visible Luvus pane. wait: false returns as soon as the pane is up and the answer arrives later as a completion message; ask for it sooner with subagent_status. Use dry_run to inspect the resolved launch plan without starting anything.",
+			"Delegate a task to a subagent running in a visible Luvus pane. wait: true (the default) blocks until it settles and returns its answer; wait: false returns as soon as the pane is up, and the answer arrives later as a completion message that wakes you. Use dry_run to inspect the resolved launch plan without starting anything.",
 		promptSnippet: "Delegate a task to a subagent running in a visible Luvus pane",
 		// The delegation policy, tuned from the subagents fork: when to reach for an
 		// agent, when to search directly instead, and what the answer means. Three rules,
@@ -1648,27 +1652,26 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	});
 
 	/**
-	 * Let the parent ask about its own delegations instead of polling Luvus through
-	 * bash: the widget is for the human, and a bash `luvus wait` is auto-backgrounded
-	 * by whatever background-task extension happens to be installed. The shape
-	 * follows pi-task's `task_status` — pull, with an optional wait.
+	 * Let the parent read its own delegations instead of scraping Luvus through bash:
+	 * the widget is for the human, and a bash `luvus wait` is auto-backgrounded by
+	 * whatever background-task extension happens to be installed.
+	 *
+	 * This is a read, not a wait. A wait whose window the model sets is a poll loop by
+	 * construction: the model cannot know how long a child will run, so it picks a
+	 * number, the number expires, and it asks again. Waiting belongs to `delegate`, once,
+	 * to the child's own end — and the answer belongs to the notice that wakes the parent
+	 * when it settles.
 	 */
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent status",
 		description:
-			"List this session's subagent delegations and their state. With wait: true, block until the named delegation settles (or timeout_ms passes) and return its answer.",
+			"List this session's subagent delegations and their state. Naming one also returns its answer, once that delegation is over.",
 		promptSnippet: "Check on subagents this session delegated",
 		parameters: Type.Object({
 			sessionName: Type.Optional(
 				Type.String({
 					description: "Subagent session name, as returned by delegate. Omit for every delegation in this session.",
-				}),
-			),
-			wait: Type.Optional(Type.Boolean({ description: "Block until it settles (default false)" })),
-			timeout_ms: Type.Optional(
-				Type.Number({
-					description: "How long to wait, in milliseconds (default: the window a blocking delegate uses)",
 				}),
 			),
 		}),
@@ -1687,65 +1690,29 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			}
 			if (rows.length === 0) return { content: [{ type: "text", text: "No delegations in this session." }] };
 
-			// Waiting is the only thing here that is not a read, and a wait that observed a
-			// settle must land in the registry — otherwise the tool blocks, then reports
-			// `working`, contradicting itself.
-			const only = rows.length === 1 ? rows[0] : undefined;
-			let waitedGone = false;
-			// The wait's own read is the answer, so the transcript is parsed once and the window
-			// in which a pushed notice sees no delivery yet is one statement wide.
-			let waitedAnswer: ChildResult | undefined;
-			if (params.wait === true && only !== undefined && only[1].state === "working") {
-				const seconds = Math.max(1, Math.ceil((params.timeout_ms ?? WAIT_SECONDS * 1000) / 1000));
-				const outcome = await waitForSettle(pi, only[1].pane, seconds);
-				if (outcome === "gone") {
-					waitedGone = true;
-					settleDelegation(only[0], "failed");
-				} else if (outcome === "settled") {
-					waitedAnswer = readChildResult(only[0]);
-					settleDelegation(only[0], settledState(outcome, waitedAnswer));
-					// Handed over by the reply below — but only when the caller named the
-					// delegation, which is the only case that includes the answer.
-					if (waitedAnswer !== undefined && params.sessionName !== undefined) markReported(only[0]);
-				}
-			}
-
 			// The registry is the authority on state: it is written by the settle watcher,
 			// which knows a delegation is over. The child's session file only supplies the
-			// text — its last terminal turn can predate a steer, so it must not decide state.
-			// Re-read the registry: the wait above may have settled a row, and rendering the
-			// pre-wait snapshot would report `working` right after blocking on it.
-			// A wait that found the pane gone leaves a reason behind: `failed` alone would
-			// not say whether anything is still running.
-			const notes: string[] = [];
-			if (waitedGone) notes.push(`pane ${only?.[1].pane ?? ""} is gone: the delegation ended when its pane was closed`);
-			const current = [...delegations.entries()].filter(
-				([name]) => params.sessionName === undefined || name === params.sessionName,
-			);
-			const lines = current.map(([name, entry]) => {
+			// text — its last terminal turn can predate a steer, so it must not decide state,
+			// and while the delegation is running that turn is provisional. Handing it over
+			// here is what made one answer arrive twice: this read, then the notice pushed
+			// when the child really settled. Reading it is also what tells that notice it has
+			// nothing left to add, so the two paths cannot both deliver the same answer.
+			const asked = params.sessionName;
+			let answer: ChildResult | undefined;
+			if (asked !== undefined && delegations.get(asked)?.state !== "working") {
+				answer = readChildResult(asked);
+				if (answer !== undefined) markReported(asked);
+			}
+			const lines = rows.map(([name, entry]) => {
 				return `${name}  ${entry.state}  ${formatElapsed(entry.startedAt, entry.endedAt)}  pane ${entry.pane}`;
 			});
-			const asked = params.sessionName;
-			// Reuse the wait's read: a second read would repeat the parse and reopen the window.
-			let answer: ChildResult | undefined;
-			if (asked !== undefined) {
-				answer = asked === only?.[0] && waitedAnswer !== undefined ? waitedAnswer : readChildResult(asked);
-			}
-			// The answer is final only once the delegation is over: a child steered after a
-			// terminal turn still has a newer answer coming, and its notice must survive this pull.
-			if (asked !== undefined && answer !== undefined && delegations.get(asked)?.state !== "working") {
-				markReported(asked);
-			}
 			return {
 				content: [
 					{
 						type: "text",
 						text: [
 							lines.join("\n"),
-							...(notes.length > 0 ? ["", ...notes] : []),
-							...(answer === undefined
-								? []
-								: ["", `answer from ${params.sessionName}:`, "", capCompletion(answer.text)]),
+							...(answer === undefined ? [] : ["", `answer from ${asked}:`, "", capCompletion(answer.text)]),
 						].join("\n"),
 					},
 				],
