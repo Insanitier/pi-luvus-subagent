@@ -805,6 +805,95 @@ function readChildResult(sessionId: string): ChildResult | undefined {
 	};
 }
 
+/** What a running child is doing, read from the session file it writes as it goes. */
+type ChildProgress = {
+	/** Named tool calls so far — the cheapest honest measure of work actually done. */
+	toolUses: number;
+	/** The last thing it was seen doing. */
+	activity: string;
+	/** When the file last changed: when the child last put anything on paper. */
+	lastWriteAt: number | undefined;
+};
+
+/**
+ * How far along a child is, for a parent that has to judge whether waiting is still the
+ * right move.
+ *
+ * A state alone cannot answer that: `working` reads the same whether the child is
+ * mid-tool or wedged, so a rule like "do not wait again if nothing changed" has nothing
+ * to test against. The facts come from the file the child writes as it goes.
+ */
+function readChildProgress(sessionId: string): ChildProgress | undefined {
+	const filePath = sessionFileFor(sessionId);
+	if (filePath === undefined) return undefined;
+	let text: string;
+	try {
+		text = readFileSync(filePath, "utf-8");
+	} catch {
+		return undefined;
+	}
+	let toolUses = 0;
+	let activity = "no tool call yet";
+	for (const line of text.split("\n")) {
+		if (line.trim().length === 0) continue;
+		let entry: { type?: string; message?: { role?: string; content?: unknown } };
+		try {
+			entry = JSON.parse(line) as typeof entry;
+		} catch {
+			continue;
+		}
+		if (entry.type !== "message" || entry.message === undefined) continue;
+		const content = Array.isArray(entry.message.content) ? entry.message.content : [];
+		for (const part of content) {
+			const piece = part as { type?: string; name?: string };
+			if (piece.type !== "toolCall") continue;
+			toolUses += 1;
+			activity = typeof piece.name === "string" ? `calling ${piece.name}` : "calling a tool";
+		}
+		if (entry.message.role === "assistant" && content.some((part) => (part as { type?: string }).type === "text")) {
+			activity = "writing";
+		}
+	}
+	let lastWriteAt: number | undefined;
+	try {
+		lastWriteAt = statSync(filePath).mtimeMs;
+	} catch {
+		lastWriteAt = undefined;
+	}
+	return { toolUses, activity, lastWriteAt };
+}
+
+/** What has changed since the parent's last read, in words a decision can be made from. */
+function sinceLastRead(progress: ChildProgress, entry: Delegation): string {
+	const seen = entry.lastRead;
+	if (seen === undefined) return "this is the first read of it";
+	const more = progress.toolUses - seen.toolUses;
+	const ago = formatElapsed(seen.at);
+	if (more > 0) return `${more} more tool call${more === 1 ? "" : "s"} since your last read ${ago} ago`;
+	return `nothing has changed since your last read ${ago} ago`;
+}
+
+/** The line a running delegation adds: what it is doing, and what moved since last read. */
+function progressLine(progress: ChildProgress | undefined, since: string | undefined): string {
+	if (progress === undefined) return "  progress: it has written no session file yet";
+	const parts = [progress.activity, `${progress.toolUses} tool call${progress.toolUses === 1 ? "" : "s"}`];
+	if (progress.lastWriteAt !== undefined) parts.push(`last write ${formatElapsed(progress.lastWriteAt)} ago`);
+	return `  progress: ${parts.join(", ")}${since === undefined ? "" : ` \u2014 ${since}`}`;
+}
+
+/**
+ * What a wait that ended at its bound leaves behind.
+ *
+ * The outcome notes above deliberately name no action: they describe a partial answer,
+ * and naming a move there is how a parent ends up re-delegating work that was done. This
+ * one is the opposite case — the parent is blocked on something that has not moved, so
+ * the way out is the message. The reference names the same moves for the same reason.
+ */
+function waitExpiredNote(boundMs: number | undefined, since: string | undefined): string {
+	const bound = boundMs === undefined ? "its bound" : `${Math.round(boundMs / 1000)}s`;
+	return `The wait ended after ${bound}, and the child was not stopped: ${since ?? "it is still working"}. Waiting again will not unstick it — steer it with a deadline (interrupt: true makes it wrap up now), or tell the user it looks stuck.`;
+}
+
 /**
  * How much of one message's answers are pushed into the parent's context.
  *
@@ -986,9 +1075,10 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 		// the nuance — `truncated`, `no-answer`. A `still running` outcome cannot reach here:
 		// the loop gives up only on a wait that ended or on a session that is stale.
 		const header = `${state === "done" ? "✓" : "✗"} ${agentName} (${line.word}, ${elapsed}, ${sessionId})`;
-		// A parent that already pulled this answer has it; the notice is the fallback for one
-		// that never asked, so there is nothing to hand over twice.
-		if (alreadyReported(sessionId)) return;
+		// A parent that already pulled this answer has it, and one blocked on a read is being
+		// handed it by that read: the notice is the fallback for a parent that neither asked
+		// nor waited, so there is nothing to hand over twice.
+		if (alreadyReported(sessionId) || waitingReads.has(sessionId)) return;
 		const shown = shownResult(result, ended);
 		const body = [shown, line.note].filter((part) => part.length > 0).join("\n\n");
 		sendNotice(pi, header, body);
@@ -1042,6 +1132,8 @@ type Delegation = {
 	 * a parent that never asked.
 	 */
 	reportedAt?: number;
+	/** What the last read of this delegation saw, so the next one can say what changed. */
+	lastRead?: { at: number; toolUses: number };
 };
 
 /** How many parent turns the widget keeps a settled row, per the reference. */
@@ -1075,6 +1167,25 @@ let entryApi: ExtensionAPI | undefined;
  * screen is not forgetting, and nothing retires a record but the session ending.
  */
 const delegations = new Map<string, Delegation>();
+
+/**
+ * Reads blocked on a delegation, resolved by the settle that ends it.
+ *
+ * The wait is on the registry, not on a Luvus wait of its own: the watcher settles this
+ * exactly once, and the promise it resolves is the same event the notice is built from —
+ * so a waiting read cannot miss the end by starting a moment too late.
+ */
+const settleWaiters = new Map<string, Set<() => void>>();
+
+/**
+ * Reads whose answer is theirs to hand over.
+ *
+ * While one waits, the notice for the same settle would be the same text twice, and a
+ * parent blocked on that read is already awake. A read that gives up — an expired bound,
+ * an interrupted parent — takes the claim back before its wait returns, so the watcher's
+ * notice is still the path that delivers.
+ */
+const waitingReads = new Set<string>();
 let statusUi: ExtensionUIContext | undefined;
 let statusTicker: ReturnType<typeof setInterval> | undefined;
 
@@ -1169,7 +1280,39 @@ function settleDelegation(sessionName: string, state: "done" | "failed"): void {
 	delegations.set(sessionName, { ...entry, endedAt, state, settledTurn: turn });
 	// The replay reads the last settled entry per delegation, so appending is enough.
 	entryApi?.appendEntry(SETTLED_ENTRY, { sessionName, state, endedAt } satisfies SettledEntry);
+	// A read waiting on this delegation is waiting for exactly this moment.
+	for (const resolve of settleWaiters.get(sessionName) ?? []) resolve();
+	settleWaiters.delete(sessionName);
 	renderStatus();
+}
+
+/**
+ * Wait for a delegation to be over, bounded or not.
+ *
+ * `boundMs` bounds the wait only: nothing here stops or interrupts the child, which is
+ * why an expired wait is a fact about the reader and not about the work.
+ */
+async function waitForDelegation(
+	sessionName: string,
+	boundMs: number | undefined,
+	signal: AbortSignal | undefined,
+): Promise<boolean> {
+	if (delegations.get(sessionName)?.endedAt !== undefined) return true;
+	await new Promise<void>((resolve) => {
+		const waiters = settleWaiters.get(sessionName) ?? new Set<() => void>();
+		waiters.add(resolve);
+		settleWaiters.set(sessionName, waiters);
+		const stop = (): void => {
+			waiters.delete(resolve);
+			resolve();
+		};
+		if (boundMs !== undefined) {
+			const timer = setTimeout(stop, boundMs);
+			timer.unref?.();
+		}
+		signal?.addEventListener("abort", stop, { once: true });
+	});
+	return delegations.get(sessionName)?.endedAt !== undefined;
 }
 
 /** Record that a delegation's answer has already reached the parent. */
@@ -1580,7 +1723,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		name: "delegate",
 		label: "Subagent",
 		description:
-			"Delegate a task to a subagent running in a visible Luvus pane. wait: true (the default) blocks until it settles and returns its answer; wait: false returns as soon as the pane is up, and the answer arrives later as a completion message that wakes you. Use dry_run to inspect the resolved launch plan without starting anything.",
+			"Delegate a task to a subagent running in a visible Luvus pane. wait: true (the default) blocks until it settles and returns its answer; wait: false returns as soon as the pane is up, and the answer arrives later as a completion message that wakes you — or, when you need it before your turn can end, wait for it with subagent_status wait: true. Use dry_run to inspect the resolved launch plan without starting anything.",
 		promptSnippet: "Delegate a task to a subagent running in a visible Luvus pane",
 		// The delegation policy, tuned from the subagents fork: when to reach for an
 		// agent, when to search directly instead, and what the answer means. Three rules,
@@ -1588,7 +1731,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		// description, and a rule that only restates either one is not worth its tokens.
 		promptGuidelines: [
 			"Reach for a subagent when answering would mean reading across several files, or when you have independent work to run in parallel — you keep the conclusion, not the file dumps.",
-			"For a single fact you can already locate, search directly; once a delegation is running, do not investigate the same thing yourself — wait for it.",
+			"For a single fact you can already locate, search directly; once a delegation is running, do not investigate the same thing yourself — wait for it (subagent_status with wait: true) rather than reading the same files again.",
 			"Give the subagent a self-contained task, and relay what matters from its answer instead of repeating it; never predict a pending result — if the user asks first, say it is still running.",
 		],
 		parameters: Type.Object({
@@ -1757,9 +1900,12 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				if (outcome === "gone") notes.push(`its pane was closed before it finished; nothing is running in pane ${pane} any more`);
 				else if (!settled) {
 					// Not WAIT_SECONDS: a wait that failed at once also lands here, and the
-					// elapsed time is true either way.
+					// elapsed time is true either way. The wait that can outlast it is named,
+					// so the parent does not have to improvise one out of repeated reads.
 					const watched = formatElapsed(delegations.get(sessionName)?.startedAt ?? Date.now());
-					notes.push(`still running after ${watched} in pane ${pane}, which the watcher now owns`);
+					notes.push(
+						`still running after ${watched} in pane ${pane}, which the watcher now owns; wait for it with subagent_status ${sessionName} wait:true, or steer it`,
+					);
 				}
 				const result = readChildResult(sessionName);
 				// A child that outlived the wait is still working: hand it to the watcher, so
@@ -1849,27 +1995,49 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	 * the widget is for the human, and a bash `luvus wait` is auto-backgrounded by
 	 * whatever background-task extension happens to be installed.
 	 *
-	 * This is a read, not a wait. A wait whose window the model sets is a poll loop by
-	 * construction: the model cannot know how long a child will run, so it picks a
-	 * number, the number expires, and it asks again. Waiting belongs to `delegate`, once,
-	 * to the child's own end — and the answer belongs to the notice that wakes the parent
-	 * when it settles.
+	 * This is a read, and `wait` belongs here, where the reference puts it: a model-set
+	 * window on a read is a poll loop, but a parent that needs the result before its own
+	 * turn can end has nowhere else to stand. What keeps it honest is that the wait ends
+	 * when the *delegation* is over rather than at a number the model guessed, and that the
+	 * answer it hands over is the one the notice would have pushed — so the two cannot both
+	 * arrive.
 	 */
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent status",
 		description:
-			"List this session's subagent delegations and their state. Naming one also returns its answer, once that delegation is over.",
-		promptSnippet: "Check on subagents this session delegated",
+			"List this session's subagent delegations and their state. Naming one also returns its answer, once that delegation is over. Set wait to be told when it is over instead of asking again: the answer then reaches you here or on the completion notice, never both.",
+		promptSnippet: "Check on subagents this session delegated, and wait for one to finish",
 		parameters: Type.Object({
 			sessionName: Type.Optional(
 				Type.String({
 					description: "Subagent session name, as returned by delegate. Omit for every delegation in this session.",
 				}),
 			),
+			wait: Type.Optional(
+				Type.Boolean({
+					description:
+						"Block until that delegation is over before answering, instead of coming back to ask again. Needs sessionName. Default: false.",
+				}),
+			),
+			timeout_ms: Type.Optional(
+				Type.Number({
+					description:
+						"Milliseconds to bound a wait; omit to wait until the delegation is over. An expired wait does not stop the child: read the progress line it returns, and if nothing has changed since your last read, waiting again will not unstick it.",
+				}),
+			),
 		}),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+			const asked = params.sessionName;
+			if (params.wait === true && asked === undefined) {
+				return {
+					content: [
+						{ type: "text", text: "wait needs a sessionName: waiting for every delegation has no single answer." },
+					],
+					isError: true,
+				};
+			}
 			const all = [...delegations.entries()];
 			const rows = params.sessionName === undefined ? all : all.filter(([name]) => name === params.sessionName);
 			if (params.sessionName !== undefined && rows.length === 0) {
@@ -1882,7 +2050,22 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				};
 			}
 			if (rows.length === 0) return { content: [{ type: "text", text: "No delegations in this session." }] };
-
+			const before = asked === undefined ? undefined : delegations.get(asked);
+			// The claim goes on before the wait: the watcher settles this delegation, and while
+			// this call is going to hand the answer over the notice must not push it too. A call
+			// that gives up takes the claim back, so the notice is the path that still delivers.
+			let expired = false;
+			if (params.wait === true && asked !== undefined && before?.endedAt === undefined) {
+				waitingReads.add(asked);
+				const over = await waitForDelegation(asked, params.timeout_ms, signal);
+				waitingReads.delete(asked);
+				expired = !over;
+			}
+			// Everything below reads the registry again, because a wait just moved it: a row or a
+			// state taken before the wait would report the child as still working in the same
+			// result that hands over its answer.
+			const shown = [...delegations.entries()].filter(([name]) => asked === undefined || name === asked);
+			const current = asked === undefined ? undefined : delegations.get(asked);
 			// The registry is the authority on state: it is written by the settle watcher,
 			// which knows a delegation is over. The child's session file only supplies the
 			// text — its last terminal turn can predate a steer, so it must not decide state,
@@ -1890,15 +2073,22 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			// here is what made one answer arrive twice: this read, then the notice pushed
 			// when the child really settled. Reading it is also what tells that notice it has
 			// nothing left to add, so the two paths cannot both deliver the same answer.
-			const asked = params.sessionName;
 			let answer: ChildResult | undefined;
-			if (asked !== undefined && delegations.get(asked)?.state !== "working") {
+			if (asked !== undefined && current?.state !== "working") {
 				answer = readChildResult(asked);
 				if (answer !== undefined) markReported(asked);
 			}
-			const lines = rows.map(([name, entry]) => {
-				return `${name}  ${entry.state}  ${formatElapsed(entry.startedAt, entry.endedAt)}  pane ${entry.pane}`;
+			// Read once: the row says what the child is doing, and remembering it is what lets
+			// the next read say whether anything moved in between.
+			const progress = asked === undefined || current?.state !== "working" ? undefined : readChildProgress(asked);
+			const since = progress === undefined || current === undefined ? undefined : sinceLastRead(progress, current);
+			const lines = shown.map(([name, entry]) => {
+				const head = `${name}  ${entry.state}  ${formatElapsed(entry.startedAt, entry.endedAt)}  pane ${entry.pane}`;
+				return entry.state === "working" ? `${head}\n${progressLine(progress, since)}` : head;
 			});
+			if (asked !== undefined && progress !== undefined && current !== undefined) {
+				delegations.set(asked, { ...current, lastRead: { at: Date.now(), toolUses: progress.toolUses } });
+			}
 			return {
 				content: [
 					{
@@ -1906,6 +2096,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						text: [
 							lines.join("\n"),
 							...(answer === undefined ? [] : ["", `answer from ${asked}:`, "", capCompletion(answer.text)]),
+							...(expired ? ["", waitExpiredNote(params.timeout_ms, since)] : []),
 						].join("\n"),
 					},
 				],

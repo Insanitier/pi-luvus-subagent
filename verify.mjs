@@ -159,6 +159,12 @@ if (argv[0] === "agent" && argv[1] === "keys" && argv[3] === "enter") {
 					: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
 		appendFileSync(file, (existsSync(file) ? "\\n" : "") + [
 			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: task }] } }),
+			// A child that has been running has called a tool by now, and the progress line a
+			// read returns counts exactly these: without one there is nothing to count.
+			JSON.stringify({
+				type: "message",
+				message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: {} }] },
+			}),
 			...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
 		].join("\\n"));
 	}
@@ -625,6 +631,105 @@ check(
 		),
 	JSON.stringify(notices.map((notice) => notice.options)),
 );
+console.log("\nwaiting for a delegation");
+await deliverQueued();
+notices.length = 0;
+// A child that stays running: the watcher keeps watching, which is what a read can wait on.
+process.env.LUVUS_STUB_UNSETTLED = "1";
+const waiting = await tools.delegate.execute(
+	"verify-wait",
+	{ agent: "fixture-bare", task: "say the thing", wait: false },
+	undefined,
+	undefined,
+	ctx,
+);
+const waitName = waiting.content[0].text.match(/fixture-bare-[0-9a-f]{6}/)?.[0];
+check(
+	"wait needs a name: waiting for every delegation has no single answer",
+	(await tools.subagent_status.execute("verify-wait-noname", { wait: true }, undefined, undefined, ctx)).isError === true,
+);
+// A state alone cannot support "do not wait again if nothing changed": `working` reads the
+// same whether the child is mid-tool or wedged. The progress line is what the model judges.
+const firstRead = (
+	await tools.subagent_status.execute("verify-wait-read", { sessionName: waitName }, undefined, undefined, ctx)
+).content[0].text;
+const secondRead = (
+	await tools.subagent_status.execute("verify-wait-read2", { sessionName: waitName }, undefined, undefined, ctx)
+).content[0].text;
+check(
+	"a running delegation reports progress, not just a state",
+	/working/.test(firstRead) &&
+		/progress: (calling \w+|writing|no tool call yet), 1 tool call/.test(firstRead) &&
+		/last write \d+s ago/.test(firstRead) &&
+		/first read/.test(firstRead),
+	firstRead,
+);
+check(
+	"a second read says what changed since the first",
+	/nothing has changed since your last read/.test(secondRead),
+	secondRead,
+);
+// A bound ends the wait and names the moves instead of leaving the model to improvise one:
+// an answer that has not moved is a reason to steer with a deadline, not to interrupt.
+const bounded = await tools.subagent_status.execute(
+	"verify-wait-bounded",
+	{ sessionName: waitName, wait: true, timeout_ms: 1200 },
+	undefined,
+	undefined,
+	ctx,
+);
+check(
+	"an expired wait says the child was not stopped, and what to do instead",
+	bounded.content[0].text.includes("was not stopped") &&
+		bounded.content[0].text.includes("steer it with a deadline") &&
+		bounded.content[0].text.includes("interrupt: true") &&
+		/nothing has changed since your last read/.test(bounded.content[0].text),
+	bounded.content[0].text,
+);
+// The read gave up, so the claim it took came back with it: the answer still arrives.
+delete process.env.LUVUS_STUB_UNSETTLED;
+await new Promise((resolve) => setTimeout(resolve, 2500));
+check(
+	"a read that gave up leaves the notice to deliver the answer",
+	notices.some((notice) => noticeText(notice).includes("STUB_ANSWER")),
+	JSON.stringify(notices.map((notice) => noticeText(notice).slice(0, 60))),
+);
+console.log("\nwaiting that is satisfied");
+await deliverQueued();
+notices.length = 0;
+process.env.LUVUS_STUB_UNSETTLED = "1";
+const blocked = await tools.delegate.execute(
+	"verify-wait-block",
+	{ agent: "fixture-bare", task: "say the thing", wait: false },
+	undefined,
+	undefined,
+	ctx,
+);
+const blockedName = blocked.content[0].text.match(/fixture-bare-[0-9a-f]{6}/)?.[0];
+// The wait is satisfied by the settle itself, not by a number: the hold is released while
+// the read is blocked, and the read returns the moment the child ends.
+setTimeout(() => {
+	delete process.env.LUVUS_STUB_UNSETTLED;
+}, 1000);
+const blockedRead = await tools.subagent_status.execute(
+	"verify-wait-block-read",
+	{ sessionName: blockedName, wait: true },
+	undefined,
+	undefined,
+	ctx,
+);
+delete process.env.LUVUS_STUB_UNSETTLED;
+check(
+	"waiting on a delegation returns its answer the moment it is over",
+	/\bdone\b/.test(blockedRead.content[0].text) && blockedRead.content[0].text.includes("STUB_ANSWER"),
+	blockedRead.content[0].text.slice(0, 200),
+);
+await new Promise((resolve) => setTimeout(resolve, 1500));
+check(
+	"the answer the wait handed over is not pushed a second time",
+	!notices.some((notice) => noticeText(notice).includes("STUB_ANSWER")),
+	JSON.stringify(notices.map((notice) => noticeText(notice).slice(0, 60))),
+);
 console.log("\nmerged notices");
 // Deliver what is queued first, the way Pi does: the same array comes back, and that
 // identity is what tells the extension the queued notice has gone out.
@@ -894,14 +999,19 @@ check(
 	JSON.stringify(policy),
 );
 check(
-	"delegate does not advertise polling: the answer arrives as a notice that wakes the parent",
-	!tools.delegate.description.includes("subagent_status") && tools.delegate.description.includes("wakes you"),
+	"delegate names the sanctioned wait instead of leaving the model to improvise one",
+	tools.delegate.description.includes("subagent_status") &&
+		tools.delegate.description.includes("wakes you") &&
+		!/poll/i.test(tools.delegate.description),
 	tools.delegate.description,
 );
 check(
-	"subagent_status takes no wait window: a model-set window is a poll loop",
-	tools.subagent_status.parameters.properties.wait === undefined &&
-		tools.subagent_status.parameters.properties.timeout_ms === undefined,
+	"the read can wait, bounded or not, the way the reference does",
+	tools.subagent_status.parameters.properties.wait !== undefined &&
+		tools.subagent_status.parameters.properties.timeout_ms !== undefined &&
+		/omit to wait until the delegation is over/.test(
+			tools.subagent_status.parameters.properties.timeout_ms.description,
+		),
 	JSON.stringify(Object.keys(tools.subagent_status.parameters.properties ?? {})),
 );
 check(
