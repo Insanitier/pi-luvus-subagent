@@ -11,13 +11,15 @@
  *   3. one whole delegation against a stub `luvus`: launch, task submit, settle
  *      detection, result extraction, the completion notice, the widget frames,
  *      the prompt-file delete and the pane close
+ *   4. the orphan sweep: which child sessions a launch reaps, which it keeps, and
+ *      what it does when it cannot trust what it read
  *
  * Isolation: HOME, PI_CODING_AGENT_DIR and LUVUS_BIN_PATH all point into a temp
  * dir, so nothing here touches the real ~/.pi/agent, a real session file, or a
  * real pane. Run it with `node verify.mjs` (or `npm test`).
  */
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -172,6 +174,30 @@ ok({});
 chmodSync(STUB, 0o755);
 process.env.LUVUS_BIN_PATH = STUB;
 process.env.LUVUS_STUB_LOG = STUB_LOG;
+
+// ── 2b. A stub `trash`, so a reaped transcript is logged, not destroyed ──────
+// The sweep hands an orphan over the way Pi deletes a conversation: to `trash` if the
+// machine has it, to an unlink if not. Prepending this to PATH makes the first path
+// observable and leaves the second one scriptable.
+const TRASH_BIN_DIR = join(HOME, "bin");
+const TRASH = join(TRASH_BIN_DIR, "trash");
+const TRASH_LOG = join(HOME, "trash.log");
+mkdirSync(TRASH_BIN_DIR, { recursive: true });
+writeFileSync(TRASH_LOG, "");
+writeFileSync(
+	TRASH,
+	`#!/usr/bin/env node
+import { appendFileSync, rmSync } from "node:fs";
+const argv = process.argv.slice(2);
+appendFileSync(process.env.TRASH_STUB_LOG, argv.join(" ") + "\\n");
+// One path is scripted to fail, so the unlink fallback is exercised too.
+if (argv[0].includes("orphan-unlink-child")) process.exit(1);
+rmSync(argv[0], { force: true });
+`,
+);
+chmodSync(TRASH, 0o755);
+process.env.TRASH_STUB_LOG = TRASH_LOG;
+process.env.PATH = `${TRASH_BIN_DIR}:${process.env.PATH}`;
 
 // ── 3. Drive the real extension with a fake Pi and a fake UI ─────────────────
 const exec = (bin, args, options = {}) =>
@@ -898,6 +924,70 @@ check(
 	replayLines.some((line) => line.startsWith("wait agent-status")),
 	replayLines.slice(0, 4).join(" | "),
 );
+console.log("\norphan sweep");
+// Pi's session directory, as the extension derives it. The sweep reads it for the names
+// that are still reachable, so a child nothing there names is what a deleted
+// conversation leaves behind.
+const PARENT_SESSIONS = join(AGENT_DIR, "sessions", "--fixture--");
+mkdirSync(PARENT_SESSIONS, { recursive: true });
+const delegationLine = (name) =>
+	JSON.stringify({
+		type: "custom",
+		customType: "luvus-subagent-delegation",
+		data: { sessionName: name, agent: "fixture-bare", task: "t", pane: "42", startedAt: 0 },
+	});
+const parentFile = join(PARENT_SESSIONS, "parent.jsonl");
+// A fork copies the entries it forked from, so a child can be named by a session that
+// did not launch it — and both files can outlive the delegation.
+writeFileSync(parentFile, `${delegationLine("kept-child")}\n`);
+writeFileSync(join(PARENT_SESSIONS, "fork.jsonl"), `${delegationLine("forked-child")}\n`);
+
+const childFile = (name) => join(SESSION_DIR, `1970-01-01T00-00-00-000Z_${name}.jsonl`);
+const longAgo = new Date(0);
+for (const name of ["kept-child", "forked-child", "orphan-child", "orphan-unlink-child"]) {
+	writeFileSync(childFile(name), "{}\n");
+	utimesSync(childFile(name), longAgo, longAgo);
+}
+// Younger than the grace window, and named by nothing: still not this sweep's business.
+writeFileSync(childFile("young-child"), "{}\n");
+
+// A Pi process appending to a session can leave its last line short. A marker line that
+// will not parse is exactly the doubt the scan does not resolve, so nothing is reaped —
+// including the two files the next check expects it to reap.
+const goodParent = readFileSync(parentFile, "utf-8");
+writeFileSync(parentFile, '{"type":"custom","customType":"luvus-subagent-delegation","data":{"sess\n');
+await tools.delegate.execute("verify-sweep-blind", { agent: "fixture-bare", task: "say the thing", wait: false }, undefined, undefined, ctx);
+check(
+	"a scan that could not read everything reaps nothing",
+	["kept-child", "orphan-child", "orphan-unlink-child"].every((name) => existsSync(childFile(name))) &&
+		readFileSync(TRASH_LOG, "utf-8") === "",
+	readFileSync(TRASH_LOG, "utf-8"),
+);
+writeFileSync(parentFile, goodParent);
+
+await tools.delegate.execute("verify-sweep", { agent: "fixture-bare", task: "say the thing", wait: false }, undefined, undefined, ctx);
+const trashLog = readFileSync(TRASH_LOG, "utf-8");
+check(
+	"a child a surviving session still names is kept",
+	existsSync(childFile("kept-child")) && !trashLog.includes("kept-child"),
+	trashLog,
+);
+check("a child only a forked session names is kept", existsSync(childFile("forked-child")), trashLog);
+check("a child too young to judge is kept", existsSync(childFile("young-child")));
+check("a child nothing names goes to the trash", trashLog.includes("orphan-child") && !existsSync(childFile("orphan-child")), trashLog);
+check(
+	"a trash that fails still reaps the file",
+	trashLog.includes("orphan-unlink-child") && !existsSync(childFile("orphan-unlink-child")),
+	trashLog,
+);
+
+// The interval is what keeps a burst of launches from rescanning, so a second launch in
+// the same hour does not look again — and an orphan made in between is still there.
+writeFileSync(childFile("late-child"), "{}\n");
+utimesSync(childFile("late-child"), longAgo, longAgo);
+await tools.delegate.execute("verify-sweep-throttled", { agent: "fixture-bare", task: "say the thing", wait: false }, undefined, undefined, ctx);
+check("a second launch in the same hour does not rescan", existsSync(childFile("late-child")));
+
 console.log("\nchild state reporter");
 process.env.LUVUS_ENV = "1";
 process.env.LUVUS_PANE_ID = "77";

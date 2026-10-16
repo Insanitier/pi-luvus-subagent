@@ -10,6 +10,7 @@
  * parent blocks; it does not change where the child runs.
  */
 
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -52,11 +53,8 @@ const skillRoots = (cwd: string): string[] => [
  */
 const SESSION_DIR = join(homedir(), ".pi", "agent", "subagent-sessions");
 
-/** The retention windows below count days; this is one day in milliseconds. */
+/** The prompt window counts days; this is one day in milliseconds. */
 const MS_PER_DAY = 86_400_000;
-
-/** Child sessions older than this are swept on the next delegation. */
-const SESSION_RETENTION_DAYS = 7;
 
 /**
  * Set on a launched child so it loads this extension for state reporting only.
@@ -81,18 +79,17 @@ const PROMPT_FILE_MODE = 0o600;
 const PROMPT_RETENTION_DAYS = 1;
 
 /**
- * Drop files past a retention window.
+ * Drop prompt files past their window.
  *
- * Both sweeps below are the same shape: a cutoff, one directory listing, and a
- * best-effort delete. Only the directory, the window, and which entries count
- * differ, so those are the parameters; `keep` says which entries are eligible.
+ * The backstop for launches that never reached a settle — a failed `agent
+ * start`, or a parent that died mid-delegation. A completed delegation removes
+ * its own file instead of waiting for this.
  */
-function sweepExpired(dir: string, retentionDays: number, keep: (entry: string) => boolean): void {
-	if (!isDirectory(dir)) return;
-	const cutoff = Date.now() - retentionDays * MS_PER_DAY;
-	for (const entry of readdirSync(dir)) {
-		if (!keep(entry)) continue;
-		const file = join(dir, entry);
+function sweepExpiredPrompts(): void {
+	if (!isDirectory(PROMPT_DIR)) return;
+	const cutoff = Date.now() - PROMPT_RETENTION_DAYS * MS_PER_DAY;
+	for (const entry of readdirSync(PROMPT_DIR)) {
+		const file = join(PROMPT_DIR, entry);
 		try {
 			if (statSync(file).mtimeMs < cutoff) rmSync(file, { force: true });
 		} catch {
@@ -102,25 +99,146 @@ function sweepExpired(dir: string, retentionDays: number, keep: (entry: string) 
 }
 
 /**
- * Drop prompt files past that window.
+ * How long one orphan scan buys.
  *
- * The backstop for launches that never reached a settle — a failed `agent
- * start`, or a parent that died mid-delegation. A completed delegation removes
- * its own file instead of waiting for this.
+ * A scan reads every session file there is, so a burst of launches rescans once
+ * instead of once per delegation. What it looks for changes only when a
+ * conversation is deleted, so the interval is about cost alone.
  */
-function sweepExpiredPrompts(): void {
-	sweepExpired(PROMPT_DIR, PROMPT_RETENTION_DAYS, () => true);
+const ORPHAN_SCAN_INTERVAL_MS = 60 * 60_000;
+
+/**
+ * How young a child session is left alone whatever the scan says.
+ *
+ * A parent appends the entry that names its child right after the launch, so this
+ * is mostly margin: nothing here needs to hurry, and a transcript deleted on a
+ * race that narrow is not recoverable.
+ */
+const ORPHAN_GRACE_MS = 60 * 60_000;
+
+/** When the last scan that could be acted on ran. */
+let lastOrphanScanAt = 0;
+
+/** Pi's session directory. The SDK exposes `getAgentDir` but no accessor for this. */
+const sessionRoot = (): string => join(getAgentDir(), "sessions");
+
+/**
+ * The child names the surviving session files still carry.
+ *
+ * `undefined` means "keep everything": no session file at all, one that cannot be
+ * read, or a marker line that will not parse — a Pi process appending to a session
+ * can leave its last line short. A name missed here deletes a transcript for
+ * nothing, so every doubt resolves the same way.
+ *
+ * A custom entry is one JSON line and only lines carrying the marker are parsed, so
+ * a session that never delegated is never decoded.
+ */
+function referencedSessionNames(): Set<string> | undefined {
+	const root = sessionRoot();
+	if (!isDirectory(root)) return undefined;
+	const names = new Set<string>();
+	// Pi groups sessions into a directory per project, so the walk is not one level.
+	const dirs = [root];
+	let files = 0;
+	for (let next = 0; next < dirs.length; next++) {
+		const dir = dirs[next] as string;
+		let entries: string[];
+		try {
+			entries = readdirSync(dir);
+		} catch {
+			return undefined;
+		}
+		for (const entry of entries) {
+			const path = join(dir, entry);
+			let directory: boolean;
+			try {
+				directory = statSync(path).isDirectory();
+			} catch {
+				return undefined;
+			}
+			if (directory) {
+				dirs.push(path);
+				continue;
+			}
+			if (!entry.endsWith(".jsonl")) continue;
+			files++;
+			let text: string;
+			try {
+				text = readFileSync(path, "utf-8");
+			} catch {
+				return undefined;
+			}
+			for (const line of text.split("\n")) {
+				if (!line.includes(DELEGATION_ENTRY)) continue;
+				let record: { customType?: string; data?: { sessionName?: string } };
+				try {
+					record = JSON.parse(line) as typeof record;
+				} catch {
+					return undefined;
+				}
+				if (record.customType === DELEGATION_ENTRY && typeof record.data?.sessionName === "string") {
+					names.add(record.data.sessionName);
+				}
+			}
+		}
+	}
+	// Not one session file: this is not where Pi keeps them, and an empty scan would
+	// orphan every child there is.
+	return files === 0 ? undefined : names;
 }
 
 /**
- * Drop child sessions past their retention window.
+ * Move a file to the platform trash, falling back to an unlink.
  *
- * Swept lazily on each delegation rather than on a timer: delegations are the
- * only thing that grows this directory, so they are also the right moment to
- * trim it.
+ * Pi deletes a conversation the same way, so a reaped transcript ends up where the
+ * conversation it belonged to went.
  */
-function sweepExpiredSessions(): void {
-	sweepExpired(SESSION_DIR, SESSION_RETENTION_DAYS, (entry) => entry.endsWith(".jsonl"));
+function discardFile(file: string): void {
+	try {
+		if (spawnSync("trash", [file], { encoding: "utf-8" }).status === 0) return;
+	} catch {
+		// No `trash` here: the unlink below is Pi's own fallback too.
+	}
+	rmSync(file, { force: true });
+}
+
+/**
+ * Drop child sessions no surviving session file names.
+ *
+ * A child is reachable only through its name, and the name lives in the entries of
+ * the conversation that delegated it: `resume` reopens by name and `subagent_status`
+ * answers by name. So a transcript nothing names is unreachable — it is what a
+ * deleted conversation leaves behind. Pi deletes one by moving its file out of
+ * `sessions/` and emits no event for it, which is why this looks rather than listens.
+ *
+ * Three things hold a file back, and each is a way of being wrong rather than slow: a
+ * name this session still holds, a child too young for its parent to have written the
+ * entry, and a scan that could not read everything. Every one of them keeps a file
+ * that could have gone; none deletes one that should have stayed.
+ */
+function sweepOrphanSessions(): void {
+	if (Date.now() - lastOrphanScanAt < ORPHAN_SCAN_INTERVAL_MS) return;
+	if (!isDirectory(SESSION_DIR)) return;
+	const referenced = referencedSessionNames();
+	if (referenced === undefined) return;
+	// Only a scan that could be acted on buys the interval: a directory nothing could be
+	// read from should not stop the next launch from trying again.
+	lastOrphanScanAt = Date.now();
+	const cutoff = Date.now() - ORPHAN_GRACE_MS;
+	for (const entry of readdirSync(SESSION_DIR)) {
+		// `<timestamp>_<name>.jsonl` — the timestamp Pi writes holds no underscore.
+		const separator = entry.indexOf("_");
+		if (!entry.endsWith(".jsonl") || separator < 0) continue;
+		const name = entry.slice(separator + 1, -".jsonl".length);
+		if (referenced.has(name) || delegations.has(name)) continue;
+		const file = join(SESSION_DIR, entry);
+		try {
+			if (statSync(file).mtimeMs > cutoff) continue;
+		} catch {
+			continue;
+		}
+		discardFile(file);
+	}
 }
 /**
  * This extension's own file, so a launched child loads it too.
@@ -913,8 +1031,6 @@ type Delegation = {
 	reportedAt?: number;
 };
 
-/** A record outlives the widget, and only age retires it — the reference's 10 minutes. */
-const RECORD_RETENTION_MS = 10 * 60_000;
 /** How many parent turns the widget keeps a settled row, per the reference. */
 const LINGER_TURNS = 1;
 /** The parent turn counter the linger is measured in. */
@@ -940,9 +1056,10 @@ let entryApi: ExtensionAPI | undefined;
  * One entry per delegation this session, keyed by session name — the only id the
  * tool and the detached watcher both hold.
  *
- * Records outlive the widget, the way the reference separates them: a settled
- * delegation stays queryable for ten minutes, while the widget draws it for a turn
- * or two and not at all once nothing is running. Clearing the screen is not forgetting.
+ * Records outlive the widget, the way the reference separates them: the widget draws a
+ * settled delegation for a turn or two and nothing at all once nothing is running,
+ * while the record still answers for as long as the conversation does. Clearing the
+ * screen is not forgetting, and nothing retires a record but the session ending.
  */
 const delegations = new Map<string, Delegation>();
 let statusUi: ExtensionUIContext | undefined;
@@ -972,10 +1089,8 @@ function stopStatusTicker(): void {
 function renderStatus(): void {
 	const ui = statusUi;
 	if (ui === undefined) return;
-	// Records retire by age, never by the widget's absence.
-	for (const [name, entry] of delegations) {
-		if (entry.endedAt !== undefined && Date.now() - entry.endedAt > RECORD_RETENTION_MS) delegations.delete(name);
-	}
+	// A record is not the widget's to retire: what the widget stops drawing stays
+	// answerable above.
 	const all = [...delegations.entries()];
 	// The widget exists only while a delegation is running: a settled list left above
 	// the editor reads as "still going" long after the work stopped. What it has drawn
@@ -1026,8 +1141,8 @@ function trackDelegation(sessionName: string, pane: string, ui: ExtensionUIConte
 		statusUi = ui;
 		ui.setStatus(STATUS_KEY, undefined);
 	}
-	// Earlier records are not cleared here: they stay queryable until their age retires
-	// them, and the widget's own linger decides what is drawn.
+	// Earlier records are not cleared here: nothing retires one but the session ending,
+	// and the widget's own linger decides what is drawn.
 	delegations.set(sessionName, { startedAt: Date.now(), state: "working", pane });
 	renderStatus();
 }
@@ -1441,7 +1556,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				// call fails; false is a value they can actually produce.
 				Type.Union([Type.Boolean(), Type.String()], {
 					description:
-						"Pass false (or omit it) to start a fresh delegation. Pass the session name of a delegation this session already ran, or a child session id, to continue that conversation. Transcripts are kept for 7 days; once swept, resume is unavailable and the earlier result is only in the transcript.",
+						"Pass false (or omit it) to start a fresh delegation. Pass the session name of a delegation this session already ran, or a child session id, to continue that conversation. A transcript is kept while a session file still names it, so it outlives its conversation only as long as another one names it; once it is gone, resume is unavailable and the earlier result is only in the transcript.",
 				}),
 			),
 			wait: Type.Optional(
@@ -1488,7 +1603,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `No session to resume for "${wantedResume}": its transcript is gone (kept for ${SESSION_RETENTION_DAYS} days). Its earlier result is still in the transcript.`,
+								text: `No session to resume for "${wantedResume}": its transcript is gone. Its earlier result is still in the transcript.`,
 							},
 						],
 						isError: true,
@@ -1507,9 +1622,9 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: planText }] };
 			}
 
-			// Launching is what grows both the session directory and the prompt
-			// directory, so it is also the right moment to trim both.
-			sweepExpiredSessions();
+			// Launching is what grows the prompt directory and what decides whether a
+			// child session is still named by anything, so both get trimmed here.
+			sweepOrphanSessions();
 			sweepExpiredPrompts();
 			// The child reads its body during startup, so it must exist before the pane opens.
 			if (promptFile !== undefined) writePromptFile(promptFile, agent.systemPrompt);

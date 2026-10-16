@@ -39,11 +39,11 @@ Completion notices are steered, never queued as follow-ups: while the parent is 
 
 A pane that is closed ends its delegation at once. A wait cannot see a state that will never arrive, so the row settles as failed instead of counting down its window — a closed pane is not a slow child. A child that ended without a finished result is reported as such — `truncated`, `aborted`, `error`, `no answer` — with the provider's own words as the answer text. Pi reports no finer cause than `stopReason`, so no cause is guessed, and the note states what happened rather than what to do about it: partial output must not read as a finished result.
 
-A delegation's record lives in the session, not in the process: the registry is rebuilt from this session's own entries, so a reload or a restart keeps it while another session never sees it. Transcripts are kept for 7 days, which is what `resume` reopens; once swept, resume is unavailable and the earlier result is only in the transcript.
+A delegation's record lives in the session, not in the process: the registry is rebuilt from this session's own entries, so a reload or a restart keeps it while another session never sees it. Nothing retires a record but the session ending — the widget stops drawing a settled row once nothing is running, and `subagent_status` still answers for it.
 
 Retrying a failed turn is deliberately not this extension's job. A retry engine belongs in an extension that hooks the session's own turn lifecycle, and one install then covers the parent and every child — children load the same configured extensions. See [pi-retry](https://github.com/monotykamary/pi-retry).
 
-Child sessions live in `~/.pi/agent/subagent-sessions` and are swept after 7 days. A child is launched with `--subagent-child`, which loads this extension for state reporting only — handing the child the tools too would let subagents spawn subagents without bound.
+Child sessions live in `~/.pi/agent/subagent-sessions`, and one is kept while some surviving session file still names it — a name is the only way back in, since `resume` reopens by it and `subagent_status` answers by it, so a transcript nothing names is what a deleted conversation left behind. Pi deletes a conversation by moving its file out of `sessions/` and emits no event for it, so the sweep looks instead of listening: it rides on a delegation launch, rescans at most once an hour, and reaps nothing it could not read in full. A child is launched with `--subagent-child`, which loads this extension for state reporting only — handing the child the tools too would let subagents spawn subagents without bound.
 
 ## Verify
 
