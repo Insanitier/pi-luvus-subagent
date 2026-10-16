@@ -864,12 +864,20 @@ function readChildProgress(sessionId: string): ChildProgress | undefined {
 }
 
 /** What has changed since the parent's last read, in words a decision can be made from. */
-function sinceLastRead(progress: ChildProgress, entry: Delegation): string {
+function sinceLastRead(progress: ChildProgress, entry: Delegation): string | undefined {
 	const seen = entry.lastRead;
-	if (seen === undefined) return "this is the first read of it";
-	const more = progress.toolUses - seen.toolUses;
+	// No earlier reading, so there is no delta to state: the row carries the wall-clock age
+	// instead, and claiming "nothing has changed" here would be a claim with no basis.
+	if (seen === undefined) return undefined;
 	const ago = formatElapsed(seen.at);
+	const more = progress.toolUses - seen.toolUses;
 	if (more > 0) return `${more} more tool call${more === 1 ? "" : "s"} since your last read ${ago} ago`;
+	// The file is what says the child is alive: a child that is thinking or streaming writes
+	// without calling another tool, and calling that "nothing changed" would invite the reader
+	// to interrupt a child that is working.
+	if (progress.lastWriteAt !== undefined && progress.lastWriteAt > seen.at) {
+		return `still writing, but no new tool call since your last read ${ago} ago`;
+	}
 	return `nothing has changed since your last read ${ago} ago`;
 }
 
@@ -877,7 +885,11 @@ function sinceLastRead(progress: ChildProgress, entry: Delegation): string {
 function progressLine(progress: ChildProgress | undefined, since: string | undefined): string {
 	if (progress === undefined) return "  progress: it has written no session file yet";
 	const parts = [progress.activity, `${progress.toolUses} tool call${progress.toolUses === 1 ? "" : "s"}`];
-	if (progress.lastWriteAt !== undefined) parts.push(`last write ${formatElapsed(progress.lastWriteAt)} ago`);
+	// Only the first read carries the wall-clock age: afterwards the tail already says what
+	// the file has done since, and two ages in one line read as two different things.
+	if (since === undefined && progress.lastWriteAt !== undefined) {
+		parts.push(`last write ${formatElapsed(progress.lastWriteAt)} ago`);
+	}
 	return `  progress: ${parts.join(", ")}${since === undefined ? "" : ` \u2014 ${since}`}`;
 }
 
@@ -962,7 +974,7 @@ function shownResult(result: ChildResult | undefined, ended: ChildOutcome): stri
  */
 let pendingNotice: { type: "text"; text: string }[] | undefined;
 
-function sendNotice(pi: ExtensionAPI, header: string, body: string): void {
+function sendNotice(pi: ExtensionAPI, header: string, body: string): boolean {
 	const queued = pendingNotice !== undefined;
 	pendingNotice ??= [];
 	// The cap is on the message, not on one child: a burst that settles together is one
@@ -971,7 +983,7 @@ function sendNotice(pi: ExtensionAPI, header: string, body: string): void {
 	const used = pendingNotice.reduce((total, part) => total + part.text.length, 0);
 	const shown = capCompletion(body, COMPLETION_OUTPUT_CAP - used);
 	pendingNotice.push({ type: "text", text: shown.length > 0 ? `${header}\n\n${shown}` : header });
-	if (queued) return;
+	if (queued) return shown === body;
 	pi.sendMessage(
 		{
 			customType: "luvus-subagent-completion",
@@ -983,6 +995,9 @@ function sendNotice(pi: ExtensionAPI, header: string, body: string): void {
 		},
 		{ deliverAs: "steer", triggerTurn: true },
 	);
+	// Whether the parent now holds the whole answer: a notice that hit the cap delivered only
+	// part of it, and the rest stays pullable from the read.
+	return shown === body;
 }
 
 /**
@@ -1081,12 +1096,18 @@ async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 		if (alreadyReported(sessionId) || waitingReads.has(sessionId)) return;
 		const shown = shownResult(result, ended);
 		const body = [shown, line.note].filter((part) => part.length > 0).join("\n\n");
-		sendNotice(pi, header, body);
+		// A notice is a delivery like any other, so it is recorded as one: without that, a read
+		// that arrives after it hands the same answer over again — measured, one answer arrived
+		// twice, once in the tool result and once here. A notice the cap cut short is the
+		// exception: the parent does not have all of it, so it stays pullable.
+		if (sendNotice(pi, header, body)) markReported(sessionId);
 	} catch (error) {
 		settleDelegation(sessionId, "failed");
 		if (isStale()) return;
 		if (alreadyReported(sessionId)) return;
-		sendNotice(pi, `✗ ${agentName} (${sessionId}) — could not read its result: ${String(error)}`, "");
+		if (sendNotice(pi, `✗ ${agentName} (${sessionId}) — could not read its result: ${String(error)}`, "")) {
+			markReported(sessionId);
+		}
 	} finally {
 		await teardownDelegation({ pi, pane, promptFile, settled: outcome === "settled" });
 	}
@@ -1452,6 +1473,12 @@ function taskInTranscript(sessionId: string, task: string): boolean {
 	return false;
 }
 
+/** How a handover ended: the child wrote the task down, or it did not, or nothing was sent. */
+type Handover =
+	| { state: "taken" }
+	| { state: "unsent" }
+	| { state: "queued"; presses: number; unsentInComposer: boolean };
+
 /**
  * Hand a task to a child and let its own transcript say whether it took it.
  *
@@ -1467,35 +1494,59 @@ function taskInTranscript(sessionId: string, task: string): boolean {
  * is the baseline, and the confirmation is the user line the child writes when it picks
  * the task up.
  *
- * A pane that reported itself busy at launch is the one case where nothing the child
- * does afterwards is evidence about this message, so it is handed back unconfirmed —
- * as is a handover the host refused, which sent nothing at all.
+ * A handover the host refused sent nothing at all, and is its own answer. A launch reply
+ * that reported the child as working is *not* one: measured live, `agent start` answered
+ * `status: "working"` for a child that was still drawing its banner and had not taken a
+ * single key — the pane's state says nothing about whether this text arrived, which is
+ * what Luvus' own guidance means by a status "does not by itself prove prompt readiness".
+ * So the status is reported, never used to decide: the transcript decides.
  */
 async function submitAndConfirm(
 	pi: ExtensionAPI,
 	sessionName: string,
 	task: string,
 	seconds: number,
-	launched: string | undefined,
-): Promise<"taken" | "queued" | "unsent"> {
-	const busy =
-		launched !== undefined && launched !== "idle" && launched !== "done" && launched !== "unknown";
-	// Paste, then submit: a long paste leaves the text sitting in the editor.
+): Promise<Handover> {
+	// Paste, then submit: a long paste leaves the text sitting in the editor on its own.
 	try {
 		await callLuvus(pi, ["agent", "prompt", sessionName, task], PROMPT_SUBMIT_TIMEOUT_MS);
 		await pressKey(pi, sessionName, "enter");
 	} catch {
 		// A pane that went away mid-hand-over refuses the paste; the caller asks whether it
 		// is gone and reports that instead of a task that was never sent.
-		return "unsent";
+		return { state: "unsent" };
 	}
-	if (busy) return "queued";
 	const deadline = Date.now() + seconds * 1000;
+	let presses = 1;
 	while (Date.now() < deadline) {
-		if (taskInTranscript(sessionName, task)) return "taken";
-		await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
+		if (taskInTranscript(sessionName, task)) return { state: "taken" };
+		// Still missing, so the paste is sitting there unsent and Enter is the step that did
+		// not land — a child that was still starting swallows one, and pressing again costs
+		// nothing while submitting is the only thing left to do.
+		await new Promise((resolve) => setTimeout(resolve, START_POLL_MS * 3));
+		if (Date.now() >= deadline) break;
+		await pressKey(pi, sessionName, "enter").catch(() => undefined);
+		presses += 1;
 	}
-	return "queued";
+	return { state: "queued", presses, unsentInComposer: await taskSitsUnsent(pi, sessionName, task) };
+}
+
+/**
+ * Whether the task text is still sitting in the child's input box.
+ *
+ * The one failure worth naming exactly: the paste landed and the Enters did not, so the
+ * task is neither lost nor running — it is waiting for the key that submits it. Without
+ * this, that case is indistinguishable from a child that read the task and ignored it,
+ * and the two call for opposite next moves.
+ */
+async function taskSitsUnsent(pi: ExtensionAPI, sessionName: string, task: string): Promise<boolean> {
+	const read = await callLuvus(pi, ["agent", "read", sessionName], PANE_PROBE_TIMEOUT_MS).catch(
+		() => undefined,
+	);
+	if (read === undefined) return false;
+	const text = typeof read.result.text === "string" ? read.result.text : "";
+	// Enough of the task to be unmistakable; the pane wraps and indents long lines.
+	return text.includes(task.slice(0, 32));
 }
 
 /** The blocking path's tool result: the child's answer, capped, plus any notes. */
@@ -1835,8 +1886,8 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			let outcome: SettleOutcome | undefined;
 			try {
 				// 2. Hand the task over, and let the child's own transcript say whether it took it.
-				const started = await submitAndConfirm(pi, sessionName, params.task, START_CONFIRM_SECONDS, launch.status);
-				if (started === "unsent") {
+				const started = await submitAndConfirm(pi, sessionName, params.task, START_CONFIRM_SECONDS);
+				if (started.state === "unsent") {
 					// Nothing reached the child, so this is a failure however the pane looks.
 					settleDelegation(sessionName, "failed");
 					settled = true;
@@ -1854,7 +1905,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				if (started === "queued") {
+				if (started.state === "queued") {
 					// A pane that is already gone is not an unstarted task: report it the way every
 					// other closed pane is, not as a countdown that never ran.
 					if (await paneIsGone(pi, pane)) {
@@ -1877,7 +1928,13 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						isStale: () => sessionStale,
 					});
 					const reported = launch.status === undefined ? "no status" : `"${launch.status}"`;
-					const unpicked = `${sessionName} was not confirmed as started: ${START_CONFIRM_SECONDS}s after the task was pasted and submitted, its transcript still held no such message (the host reported ${reported} when the pane came up). It may still be picked up, so check it or steer it instead of sending the task again; its pane is left open, and the answer arrives as a notice if the child produces one.`;
+					const presses = `${started.presses} Enter${started.presses === 1 ? "" : "s"}`;
+					// Two failures wear the same face and call for opposite moves, so they are named
+					// apart: a task sitting in the input box is not lost and not running — it is waiting
+					// for the key that submits it, and pressing it again is the whole fix.
+					const unpicked = started.unsentInComposer
+						? `${sessionName} still has the task sitting in its input box: the paste landed, and ${presses} over ${START_CONFIRM_SECONDS}s did not submit it (the host reported ${reported} when the pane came up). Nothing is running — steer it to press that key again, rather than sending the task a second time.`
+						: `${sessionName} did not confirm the task: it was pasted and submitted ${presses} over ${START_CONFIRM_SECONDS}s, its transcript still held no such message, and its input box is empty (the host reported ${reported} when the pane came up). It may still be picked up, so check it or steer it instead of sending the task again; its pane is left open.`;
 					return { content: [{ type: "text", text: unpicked }], isError: true };
 				}
 				if (wait) {
@@ -1971,15 +2028,17 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				const how = params.interrupt === true ? "Interrupted, then" : "Sent to";
 				// A steer has no launch reply to read: the child is normally already working, which
 				// is exactly when a status proves nothing. Its transcript is the evidence instead.
-				const verdict = await submitAndConfirm(pi, params.sessionName, params.message, STEER_CONFIRM_SECONDS, undefined);
-				// Three facts, and only three: the child wrote the message down, the host refused it,
-				// or it was accepted and the child has not written it down yet.
+				const verdict = await submitAndConfirm(pi, params.sessionName, params.message, STEER_CONFIRM_SECONDS);
+				// Four facts, and only four: the child wrote the message down, the host refused it,
+				// it is sitting in the input box unsent, or it was accepted and not written down yet.
 				const text =
-					verdict === "taken"
+					verdict.state === "taken"
 						? `${how} ${params.sessionName}, and it is working.`
-						: verdict === "unsent"
+						: verdict.state === "unsent"
 							? `${how} ${params.sessionName} — nothing was sent: the host refused the message.`
-							: `${how} ${params.sessionName} — queued; the host took the message, but pickup is not confirmed.`;
+							: verdict.unsentInComposer
+								? `${how} ${params.sessionName} — the message is sitting in its input box unsent, so steer it again to press Enter.`
+								: `${how} ${params.sessionName} — queued; the host took the message, but pickup is not confirmed.`;
 				return { content: [{ type: "text", text }] };
 			} catch (error) {
 				return {
@@ -2074,7 +2133,13 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			// when the child really settled. Reading it is also what tells that notice it has
 			// nothing left to add, so the two paths cannot both deliver the same answer.
 			let answer: ChildResult | undefined;
+			// Whether the parent already holds this answer: the notice records its own delivery now,
+			// so a read can tell an answer it is handing over for the first time from one that is
+			// already in the conversation. Repeating it would be the same words twice, and a parent
+			// that reads a notice as "the rest of the story" is what that costs.
+			let delivered = false;
 			if (asked !== undefined && current?.state !== "working") {
+				delivered = alreadyReported(asked);
 				answer = readChildResult(asked);
 				if (answer !== undefined) markReported(asked);
 			}
@@ -2089,13 +2154,27 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			if (asked !== undefined && progress !== undefined && current !== undefined) {
 				delegations.set(asked, { ...current, lastRead: { at: Date.now(), toolUses: progress.toolUses } });
 			}
+			// A parent that asks again for an answer it already has is pointed at it rather than
+			// handed the same words twice: the notice carries them above, and the child's session
+			// file still holds them for anyone who needs the text back later.
+			const deliveredNote =
+				delivered && asked !== undefined
+					? `${asked} handed this answer over already: it is in the completion notice above${
+							sessionFileFor(asked) === undefined
+								? ""
+								: `, and the child's own session file has it at ${sessionFileFor(asked)}`
+						}.`
+					: undefined;
 			return {
 				content: [
 					{
 						type: "text",
 						text: [
 							lines.join("\n"),
-							...(answer === undefined ? [] : ["", `answer from ${asked}:`, "", capCompletion(answer.text)]),
+							...(answer === undefined || delivered
+								? []
+								: ["", `answer from ${asked}:`, "", capCompletion(answer.text)]),
+							...(deliveredNote === undefined ? [] : ["", deliveredNote]),
 							...(expired ? ["", waitExpiredNote(params.timeout_ms, since)] : []),
 						].join("\n"),
 					},

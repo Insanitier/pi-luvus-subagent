@@ -140,6 +140,13 @@ if (argv[0] === "agent" && argv[1] === "keys" && argv[3] === "enter") {
 	const pending = join(sessionDir, argv[2] + ".pending");
 	// A task text of NEVER_PICKED is a child that never starts working, Enter or not.
 	const task = existsSync(pending) ? readFileSync(pending, "utf-8") : "NEVER_PICKED";
+	// Counting the presses is what models a child that swallows an Enter: measured against a
+	// real pane, the first one went nowhere while the child was still drawing its banner and
+	// the task sat in its composer. STUBBORN_TASK keeps that shape.
+	const presses = join(sessionDir, argv[2] + ".presses");
+	const count = (existsSync(presses) ? Number(readFileSync(presses, "utf-8")) : 0) + 1;
+	writeFileSync(presses, String(count));
+	if (task === "STUBBORN_TASK" && count === 1) ok({ swallowed: true });
 	// The host's view of the child: idle until the Enter lands, then working. NEVER_PICKED
 	// never leaves idle, which is what an unpicked delegation looks like from here.
 	writeFileSync(join(sessionDir, argv[2] + ".state"), task === "NEVER_PICKED" ? "idle" : "working");
@@ -169,6 +176,13 @@ if (argv[0] === "agent" && argv[1] === "keys" && argv[3] === "enter") {
 		].join("\\n"));
 	}
 	ok({});
+}
+if (argv[0] === "agent" && argv[1] === "read") {
+	// The composer holds the paste until something submits it: this is what a handover reads
+	// when its Enters did not land, to tell a task waiting for a key from one never sent.
+	const pending = join(sessionDir, argv[2] + ".pending");
+	const task = existsSync(pending) ? readFileSync(pending, "utf-8") : "";
+	ok({ text: task === "" ? "no pending input" : "\u276f " + task });
 }
 if (argv[0] === "wait") process.exit(process.env.LUVUS_STUB_GONE === "1" ? 2 : process.env.LUVUS_STUB_UNSETTLED === "1" ? 1 : 0);
 if (argv[0] === "agent" && argv[1] === "get") {
@@ -512,9 +526,9 @@ const unpicked = await tools.delegate.execute(
 check(
 	"a task the child never took is unconfirmed, and says what the host reported",
 	unpicked.isError === true &&
-		unpicked.content[0].text.includes("was not confirmed as started") &&
+		unpicked.content[0].text.includes("still has the task sitting in its input box") &&
 		unpicked.content[0].text.includes('"idle"') &&
-		unpicked.content[0].text.includes("steer it instead of sending the task again"),
+		unpicked.content[0].text.includes("steer it to press that key again"),
 	unpicked.content[0].text,
 );
 check(
@@ -531,17 +545,15 @@ check(
 	/working/.test(unpickedRow) && !/failed/.test(unpickedRow),
 	unpickedRow,
 );
-// A pane that came up already working proves nothing about the message just sent, and the
-// guidance is not to kill it over that: when it still had a child in it, the handover is
-// handed back unconfirmed — at once, since the launch reply already said as much.
+// A launch reply that already says `working` proves nothing about the message: measured
+// live, `agent start` answered `working` for a child still drawing its banner that had
+// taken no key at all. So the launch status is reported, never used to decide — and the
+// transcript confirms the task as it does for any other child.
 const busyId = "busy-pane-fixture";
 writeFileSync(
 	join(resumeDir, `1970-01-01T00-00-00-000Z_${busyId}.jsonl`),
 	JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "an older task" }] } }),
 );
-process.env.LUVUS_STUB_UNSETTLED = "1";
-const busyLogStart = readFileSync(STUB_LOG, "utf-8").length;
-const busySentAt = Date.now();
 const busyStarted = await tools.delegate.execute(
 	"verify-busy-pane",
 	{ agent: "fixture-bare", task: "a new task", resume: busyId },
@@ -549,18 +561,24 @@ const busyStarted = await tools.delegate.execute(
 	undefined,
 	ctx,
 );
-delete process.env.LUVUS_STUB_UNSETTLED;
 check(
-	"a pane that was already working is handed back unconfirmed, and not killed",
-	busyStarted.isError === true &&
-		busyStarted.content[0].text.includes('"working"') &&
-		!readFileSync(STUB_LOG, "utf-8").slice(busyLogStart).includes("pane close"),
-	busyStarted.content[0].text,
+	"a launch status that says working does not decide anything: the transcript still does",
+	busyStarted.isError !== true && busyStarted.content[0].text.includes("STUB_ANSWER"),
+	busyStarted.content[0].text.slice(0, 200),
+);
+// A child that swallows the first Enter is the failure the live run produced: the task sits
+// in its composer unsent. Pressing again is the whole fix, so the handover presses again.
+const stubborn = await tools.delegate.execute(
+	"verify-stubborn",
+	{ agent: "fixture-bare", task: "STUBBORN_TASK" },
+	undefined,
+	undefined,
+	ctx,
 );
 check(
-	"an already-working pane is not waited on: the launch reply settles it",
-	Date.now() - busySentAt < 10_000,
-	`${Date.now() - busySentAt}ms`,
+	"an Enter the child swallowed is pressed again until the task lands",
+	stubborn.isError !== true && stubborn.content[0].text.includes("STUB_ANSWER"),
+	stubborn.content[0].text.slice(0, 200),
 );
 // A pane that closed is a real failure, and the row the widget colours has to come from
 // one: an unconfirmed start is no longer recorded as a failure.
@@ -659,9 +677,9 @@ const secondRead = (
 check(
 	"a running delegation reports progress, not just a state",
 	/working/.test(firstRead) &&
-		/progress: (calling \w+|writing|no tool call yet), 1 tool call/.test(firstRead) &&
-		/last write \d+s ago/.test(firstRead) &&
-		/first read/.test(firstRead),
+		/progress: (calling \w+|writing|no tool call yet), 1 tool call, last write \d+s ago/.test(firstRead) &&
+		// No delta on a first read: there is nothing yet to compare against.
+		!/since your last read/.test(firstRead),
 	firstRead,
 );
 check(
@@ -799,9 +817,14 @@ const oneRow = await tools.subagent_status.execute(
 	undefined,
 	ctx,
 );
+// The notice already handed this answer over, and the read says so instead of saying it
+// again: one answer is delivered once, whichever path carried it, and the row points at
+// where the text still is rather than repeating it into the context a second time.
 check(
-	"status returns the settled delegation's answer",
-	oneRow.content[0].text.includes("STUB_ANSWER"),
+	"status points at an answer the notice already delivered, instead of repeating it",
+	/\bhanded this answer over already\b/.test(oneRow.content[0].text) &&
+		oneRow.content[0].text.includes("session file has it at") &&
+		!oneRow.content[0].text.includes("STUB_ANSWER"),
 	oneRow.content[0].text,
 );
 
