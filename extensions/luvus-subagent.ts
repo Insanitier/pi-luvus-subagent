@@ -15,6 +15,7 @@ import { rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
 	CONFIG_DIR_NAME,
+	type AgentToolResult,
 	CustomEditor,
 	type ExtensionAPI,
 	type ExtensionUIContext,
@@ -25,6 +26,61 @@ import {
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { installStateReporter } from "./luvus-subagent/state-reporter.ts";
+import {
+	answerAlreadyDelivered,
+	clearQueuedNotice,
+	deliverWhenSettled,
+	holdDeliveryFor,
+	queuedNotice,
+	recordDelivery,
+	registerCompletionRenderer,
+	releaseDeliveryHold,
+	teardownDelegation,
+} from "./luvus-subagent/delivery.ts";
+import {
+	COLLAPSED_LINES,
+	COMPLETION_OUTPUT_CAP,
+	capCompletion,
+	endedOf,
+	outcomeLine,
+	settledState,
+	shownResult,
+	waitExpiredNote,
+} from "./luvus-subagent/outcome.ts";
+import {
+	type Delegation,
+	type DelegationEntry,
+	type ReplayEntry,
+	LINGER_TURNS,
+	STATUS_KEY,
+	attachEntryApi,
+	beginSession,
+	countTurn,
+	delegations,
+	endSession,
+	entryApi,
+	formatElapsed,
+	progressLine,
+	rememberTerminal,
+	renderStatus,
+	replayDelegations,
+	restartTurnCount,
+	settleDelegation,
+	settleWaiters,
+	sinceLastRead,
+	stopStatusTicker,
+	trackDelegation,
+	waitForDelegation,
+} from "./luvus-subagent/registry.ts";
+import {
+	type AgentConfig,
+	type LaunchPlan,
+	discoverAgents,
+	formatArgv,
+	prepareLaunch,
+	promptFileFor,
+	writePromptFile,
+} from "./luvus-subagent/agents.ts";
 import {
 	type ChildOutcome,
 	type ChildProgress,
@@ -55,7 +111,6 @@ import {
 	stateAuthority,
 	waitForSettle,
 } from "./luvus-subagent/luvus.ts";
-import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./luvus-subagent/agents.ts";
 import { installRawPaste } from "./luvus-subagent/editor.ts";
 import { DELEGATION_ENTRY, SETTLED_ENTRY, SUBAGENT_CHILD_FLAG } from "./luvus-subagent/env.ts";
 import { sweepExpiredPrompts, sweepOrphanSessions } from "./luvus-subagent/sweeps.ts";
@@ -68,220 +123,6 @@ export { discoverAgents, prepareLaunch, writePromptFile } from "./luvus-subagent
 
 
 
-// ── Result from the child's own session ────────────────────────────────────
-
-/** Stop reasons that mean the assistant message is final rather than intermediate. */
-/**
- * The word and the parenthetical note for one outcome.
- *
- * The note states what happened, never what to do about it: naming an action raises
- * its salience, which is how a parent that reads partial output as a finished result
- * ends up delegating the same work twice. Same shape as `pi-subagents`.
- */
-function outcomeLine(outcome: ChildOutcome): { word: string; note: string } {
-	switch (outcome) {
-		case "truncated":
-			return { word: "truncated", note: "(hit the output limit before finishing — the answer may be truncated)" };
-		case "aborted":
-			return {
-				word: "aborted",
-				note: "(aborted before it finished — the answer may be incomplete; its pane is still there)",
-			};
-		case "error":
-			return {
-				word: "error",
-				note: "(its last turn ended as error — the task did not finish; its pane is still there)",
-			};
-		case "no-answer":
-			return {
-				word: "no answer",
-				note: "(it settled without writing an answer — there is no result to read; its pane is still there)",
-			};
-		case "pane closed":
-			return { word: "pane closed", note: "(its pane was closed before it finished)" };
-		case "still running":
-			return { word: "still running", note: "" };
-		default:
-			return { word: "done", note: "" };
-	}
-}
-
-/** What has changed since the parent's last read, in words a decision can be made from. */
-function sinceLastRead(progress: ChildProgress, entry: Delegation): string | undefined {
-	const seen = entry.lastRead;
-	// No earlier reading, so there is no delta to state: the row carries the wall-clock age
-	// instead, and claiming "nothing has changed" here would be a claim with no basis.
-	if (seen === undefined) return undefined;
-	const ago = formatElapsed(seen.at);
-	const more = progress.toolUses - seen.toolUses;
-	if (more > 0) return `${more} more tool call${more === 1 ? "" : "s"} since your last read ${ago} ago`;
-	// The file is what says the child is alive: a child that is thinking or streaming writes
-	// without calling another tool, and calling that "nothing changed" would invite the reader
-	// to interrupt a child that is working.
-	if (progress.lastWriteAt !== undefined && progress.lastWriteAt > seen.at) {
-		return `still writing, but no new tool call since your last read ${ago} ago`;
-	}
-	return `nothing has changed since your last read ${ago} ago`;
-}
-
-/** The line a running delegation adds: what it is doing, and what moved since last read. */
-function progressLine(progress: ChildProgress | undefined, since: string | undefined): string {
-	if (progress === undefined) return "  progress: it has written no session file yet";
-	const parts = [progress.activity, `${progress.toolUses} tool call${progress.toolUses === 1 ? "" : "s"}`];
-	// Only the first read carries the wall-clock age: afterwards the tail already says what
-	// the file has done since, and two ages in one line read as two different things.
-	if (since === undefined && progress.lastWriteAt !== undefined) {
-		parts.push(`last write ${formatElapsed(progress.lastWriteAt)} ago`);
-	}
-	return `  progress: ${parts.join(", ")}${since === undefined ? "" : ` \u2014 ${since}`}`;
-}
-
-/**
- * What a wait that ended at its bound leaves behind.
- *
- * The outcome notes above deliberately name no action: they describe a partial answer,
- * and naming a move there is how a parent ends up re-delegating work that was done. This
- * one is the opposite case — the parent is blocked on something that has not moved, so
- * the way out is the message. The reference names the same moves for the same reason.
- */
-function waitExpiredNote(boundMs: number | undefined, since: string | undefined): string {
-	const bound = boundMs === undefined ? "its bound" : `${Math.round(boundMs / 1000)}s`;
-	return `The wait ended after ${bound}, and the child was not stopped: ${since ?? "it is still working"}. Waiting again will not unstick it — steer it with a deadline (interrupt: true makes it wrap up now), or tell the user it looks stuck.`;
-}
-
-/**
- * How much of one message's answers are pushed into the parent's context.
- *
- * The official subagent example caps its own output at this size; past it the
- * answer still lives in the child's pane and session file. The cap is on the
- * message, so a burst that settles together cannot push one cap per child.
- */
-const COMPLETION_OUTPUT_CAP = 50 * 1024;
-
-/** Lines of the answer shown before the card asks for Ctrl+O. */
-const COLLAPSED_LINES = 3;
-
-function capCompletion(text: string, room = COMPLETION_OUTPUT_CAP): string {
-	if (text.length <= room) return text;
-	const kb = COMPLETION_OUTPUT_CAP / 1024;
-	if (room <= 0) return `(answer omitted: this notice already reached ${kb}KB — read it with subagent_status or in the child's pane)`;
-	return `${text.slice(0, room)}\n\n… truncated at ${kb}KB per notice; the rest is in the child's pane and session file.`;
-}
-
-/** How a delegation ended, from the wait that observed it and the child's own last turn. */
-function endedOf(outcome: SettleOutcome | undefined, result: ChildResult | undefined): ChildOutcome {
-	return outcome === "gone" ? "pane closed" : outcome === "settled" ? (result?.outcome ?? "no-answer") : "still running";
-}
-
-/**
- * The registry state for a delegation whose wait ended.
- *
- * A closed pane is a failure whatever the transcript says; otherwise the child's own last
- * turn decides. One rule for the widget, the notice and the tool result: three spellings of
- * it used to drift apart.
- */
-function settledState(outcome: SettleOutcome | undefined, result: ChildResult | undefined): "done" | "failed" {
-	return outcome === "gone" || result?.status === "failed" ? "failed" : "done";
-}
-
-/**
- * The answer text a result may carry, or "" when there is none to hand over.
- *
- * A child that outlived its wait is still working, and a terminal turn its session file
- * already holds is provisional — it can be superseded by a newer one before the child is
- * done. Handing it over is what made one answer arrive twice: here, and again in the
- * notice the watcher pushes when the child really settles. The outcome's own note says
- * the child is still running, so the placeholder that used to stand in for the answer is
- * noise; and the window a caller spends waiting is never the model's to shorten.
- */
-function shownResult(result: ChildResult | undefined, ended: ChildOutcome): string {
-	if (ended === "still running" || result === undefined) return "";
-	return capCompletion(result.text);
-}
-
-/**
- * Completion notices, delivered as one message.
- *
- * A notice that arrives while an earlier one is still waiting to be delivered rides
- * along with it, so a burst of children settling costs the parent one wake-up instead
- * of one each. Identity is what says the queued message went out: `message_start`
- * hands back the same array. The settled-and-idle check is the net under it, because a
- * delivery discarded with Escape never starts, and nothing else would clear it.
- *
- * `steer`, not `followUp`: while the parent is streaming, Pi reads the mode and delivers a
- * steer after the current turn's tool calls and before the next model call, so the notice
- * reaches a parent that can still act on it; a follow-up waits for the whole turn to end,
- * which is how a parent that already asked ends up handed the same answer twice. While the
- * parent is idle the two are the same thing — `triggerTurn` starts the run either way — and
- * a steer cannot split a tool call from its result.
- */
-let pendingNotice: { type: "text"; text: string }[] | undefined;
-
-function sendNotice(pi: ExtensionAPI, header: string, body: string): boolean {
-	const queued = pendingNotice !== undefined;
-	pendingNotice ??= [];
-	// The cap is on the message, not on one child: a burst that settles together is one
-	// message, so it must not push one cap per child into the parent. Only the body is capped:
-	// a header says which child this is and how it ended, and nothing else in the message does.
-	const used = pendingNotice.reduce((total, part) => total + part.text.length, 0);
-	const shown = capCompletion(body, COMPLETION_OUTPUT_CAP - used);
-	pendingNotice.push({ type: "text", text: shown.length > 0 ? `${header}\n\n${shown}` : header });
-	if (queued) return shown === body;
-	pi.sendMessage(
-		{
-			customType: "luvus-subagent-completion",
-			// The answer rides along, capped; the renderer draws each part as its own
-			// header plus a few lines, so the transcript stays readable without hiding
-			// the result from the parent.
-			content: pendingNotice,
-			display: true,
-		},
-		{ deliverAs: "steer", triggerTurn: true },
-	);
-	// Whether the parent now holds the whole answer: a notice that hit the cap delivered only
-	// part of it, and the rest stays pullable from the read.
-	return shown === body;
-}
-
-/**
- * Draw a completion notice as a card: one header per child, then a few lines of its
- * answer, the rest behind Ctrl+O.
- *
- * The model still receives the whole text — packaging the display is what keeps the
- * transcript readable, and dropping the text instead would hide the answer from the
- * parent. A header's glyph is its status, so a merged card colours every child right.
- */
-function registerCompletionRenderer(pi: ExtensionAPI): void {
-	pi.registerMessageRenderer("luvus-subagent-completion", (message, { expanded, outputPad }, theme) => {
-		const parts =
-			typeof message.content === "string"
-				? [message.content]
-				: message.content.filter((part) => part.type === "text").map((part) => part.text);
-		const box = new Box(outputPad, 1, (line) => theme.bg("customMessageBg", line));
-		for (const part of parts) {
-			const [head = "", ...rest] = part.split("\n");
-			const body = rest.filter((line) => line.trim().length > 0);
-			const color = head.startsWith("✗") ? "error" : head.startsWith("⌛") ? "muted" : "success";
-			box.addChild(new Text(theme.fg(color, head), 0, 0));
-			if (expanded) {
-				if (body.length > 0) box.addChild(new Markdown(body.join("\n"), 0, 0, getMarkdownTheme()));
-				continue;
-			}
-			const preview = body.slice(0, COLLAPSED_LINES);
-			if (preview.length > 0) box.addChild(new Text(theme.fg("toolOutput", preview.join("\n")), 0, 0));
-			if (body.length > preview.length) {
-				box.addChild(
-					new Text(
-						theme.fg("muted", `… ${body.length - preview.length} more lines (Ctrl+O to expand)`),
-						0,
-						0,
-					),
-				);
-			}
-		}
-		return box;
-	});
-}
 /**
  * Watch a background child to completion and hand its result to the parent.
  *
@@ -289,377 +130,6 @@ function registerCompletionRenderer(pi: ExtensionAPI): void {
  * this promise. Messaging the session is what tells the parent the child is
  * done, so this is the only delivery path a background delegation has.
  */
-type SettleWatch = {
-	pi: ExtensionAPI;
-	pane: string;
-	sessionId: string;
-	agentName: string;
-	promptFile: string | undefined;
-	isStale: () => boolean;
-};
-
-async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
-	const { pi, pane, sessionId, agentName, promptFile, isStale } = watch;
-	// The registry owns the start time, so the notice and the widget agree.
-	const startedAt = delegations.get(sessionId)?.startedAt ?? Date.now();
-	let outcome: SettleOutcome = "timeout";
-	try {
-		// A wait that ran out is not the child's end, so the watcher keeps watching until
-		// it settles or its pane dies: a long task is never recorded as finished while it
-		// is still running. The floor stops a wait that fails at once from spinning.
-		for (;;) {
-			const cycleStart = Date.now();
-			outcome = await waitForSettle(pi, pane);
-			if (outcome !== "timeout" || isStale()) break;
-			const spent = Date.now() - cycleStart;
-			// A wait that failed at once is not the child's end: wait out the floor and watch
-			// again, rather than leave a `working` record that nothing will ever settle.
-			if (spent < WAIT_FLOOR_MS) await new Promise((resolve) => setTimeout(resolve, WAIT_FLOOR_MS - spent));
-		}
-		const result = readChildResult(sessionId);
-		// A closed pane is a delegation that ended without finishing; a wait that ran out
-		// leaves a child that is still working, which is not a failure and not an end.
-		// The one rule, computed once: the settle entry, the widget and the notice's glyph
-		// all read it, so a card cannot contradict the row it belongs to.
-		const state = settledState(outcome, result);
-		if (outcome !== "timeout") settleDelegation(sessionId, state);
-		if (isStale()) return;
-
-		const elapsed = `${Math.round((Date.now() - startedAt) / 1000)}s`;
-		// The notice carries the same single dimension as the tool result.
-		const ended = endedOf(outcome, result);
-		const line = outcomeLine(ended);
-		// The glyph is the state, so the card and the widget agree; `line.word` still carries
-		// the nuance — `truncated`, `no-answer`. A `still running` outcome cannot reach here:
-		// the loop gives up only on a wait that ended or on a session that is stale.
-		const header = `${state === "done" ? "✓" : "✗"} ${agentName} (${line.word}, ${elapsed}, ${sessionId})`;
-		// A parent that already pulled this answer has it, and one blocked on a read is being
-		// handed it by that read: the notice is the fallback for a parent that neither asked
-		// nor waited, so there is nothing to hand over twice.
-		if (alreadyReported(sessionId) || waitingReads.has(sessionId)) return;
-		const shown = shownResult(result, ended);
-		const body = [shown, line.note].filter((part) => part.length > 0).join("\n\n");
-		// A notice is a delivery like any other, so it is recorded as one: without that, a read
-		// that arrives after it hands the same answer over again — measured, one answer arrived
-		// twice, once in the tool result and once here. A notice the cap cut short is the
-		// exception: the parent does not have all of it, so it stays pullable.
-		if (sendNotice(pi, header, body)) markReported(sessionId);
-	} catch (error) {
-		settleDelegation(sessionId, "failed");
-		if (isStale()) return;
-		if (alreadyReported(sessionId)) return;
-		if (sendNotice(pi, `✗ ${agentName} (${sessionId}) — could not read its result: ${String(error)}`, "")) {
-			markReported(sessionId);
-		}
-	} finally {
-		await teardownDelegation({ pi, pane, promptFile, settled: outcome === "settled" });
-	}
-}
-
-/**
- * Remove a delegation's prompt file and, when it settled, close its pane.
- *
- * The prompt file goes first and unconditionally: even a child that never
- * settled read its body during startup. A pane still working is kept.
- */
-async function teardownDelegation(watch: {
-	pi: ExtensionAPI;
-	pane: string;
-	promptFile: string | undefined;
-	settled: boolean;
-}): Promise<void> {
-	const { pi, pane, promptFile, settled } = watch;
-	// A child that never settled keeps its pane: it is still working, and
-	// closing it would kill work the parent was told is still in progress.
-	// The child read its body during startup; by now it cannot still need it.
-	if (promptFile !== undefined) rmSync(promptFile, { force: true });
-	if (!settled) return;
-	await closePane(pi, pane);
-}
-
-// ── Where a child is shown, and what the parent sees while it runs ─────────
-
-/** Key the status line and the widget are published under. */
-const STATUS_KEY = "subagents";
-
-type Delegation = {
-	startedAt: number;
-	endedAt?: number;
-	state: "working" | "done" | "failed";
-	pane: string;
-	/** The parent turn it settled in: the widget's linger is counted in turns. */
-	settledTurn?: number;
-	/**
-	 * When the answer reached the parent. Both delivery paths set it — the result a parent
-	 * pulled, and the blocking call's own result — so the pushed notice can tell that it has
-	 * nothing left to add. Whichever path delivers first wins; the notice is the fallback for
-	 * a parent that never asked.
-	 */
-	reportedAt?: number;
-	/** What the last read of this delegation saw, so the next one can say what changed. */
-	lastRead?: { at: number; toolUses: number };
-	/**
-	 * The terminal instance this delegation was last seen running in.
-	 *
-	 * The pane is a small integer the host hands out again after a close, the terminal id
-	 * is not — so this is what a later steer checks before it types into a stranger's pane.
-	 */
-	terminalId?: string;
-};
-
-/** How many parent turns the widget keeps a settled row, per the reference. */
-const LINGER_TURNS = 1;
-/** The parent turn counter the linger is measured in. */
-let turn = 0;
-
-/**
- * The session entries the registry is rebuilt from.
- *
- * Pi stores a custom entry without sending it to the model, so the record costs no
- * context and travels with the conversation: a reload, a restart or a compaction
- * brings the delegations back instead of losing them with the process.
- */
-
-type DelegationEntry = { sessionName: string; agent: string; task: string; pane: string; startedAt: number };
-type SettledEntry = { sessionName: string; state: "done" | "failed"; endedAt: number };
-
-/** The API entries are appended through; set once at load, like the widget's UI. */
-let entryApi: ExtensionAPI | undefined;
-
-/**
- * One entry per delegation this session, keyed by session name — the only id the
- * tool and the detached watcher both hold.
- *
- * Records outlive the widget, the way the reference separates them: the widget draws a
- * settled delegation for a turn or two and nothing at all once nothing is running,
- * while the record still answers for as long as the conversation does. Clearing the
- * screen is not forgetting, and nothing retires a record but the session ending.
- */
-const delegations = new Map<string, Delegation>();
-
-/**
- * Reads blocked on a delegation, resolved by the settle that ends it.
- *
- * The wait is on the registry, not on a Luvus wait of its own: the watcher settles this
- * exactly once, and the promise it resolves is the same event the notice is built from —
- * so a waiting read cannot miss the end by starting a moment too late.
- */
-const settleWaiters = new Map<string, Set<() => void>>();
-
-/**
- * Reads whose answer is theirs to hand over.
- *
- * While one waits, the notice for the same settle would be the same text twice, and a
- * parent blocked on that read is already awake. A read that gives up — an expired bound,
- * an interrupted parent — takes the claim back before its wait returns, so the watcher's
- * notice is still the path that delivers.
- */
-const waitingReads = new Set<string>();
-let statusUi: ExtensionUIContext | undefined;
-let statusTicker: ReturnType<typeof setInterval> | undefined;
-
-// There is deliberately no linger timer here: the widget is cleared the moment
-// nothing is running (see renderStatus). A finished row is history, not a status.
-
-function formatElapsed(startedAt: number, endedAt?: number): string {
-	const seconds = Math.max(0, Math.round(((endedAt ?? Date.now()) - startedAt) / 1000));
-	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
-}
-/** Stop the 1s repaint that keeps a running delegation's duration live. */
-function stopStatusTicker(): void {
-	if (statusTicker === undefined) return;
-	clearInterval(statusTicker);
-	statusTicker = undefined;
-}
-
-/**
- * Repaint the widget from the registry.
- *
- * Rows follow the todo overlay's shape — a heading, `├─`/`└─` rows, a trailing
- * spacer — because it is the same slot above the editor, and one line per
- * delegation colored by state reads faster than a footer that only tallied.
- */
-function renderStatus(): void {
-	const ui = statusUi;
-	if (ui === undefined) return;
-	// A record is not the widget's to retire: what the widget stops drawing stays
-	// answerable above.
-	const all = [...delegations.entries()];
-	// The widget exists only while a delegation is running: a settled list left above
-	// the editor reads as "still going" long after the work stopped. What it has drawn
-	// is not forgotten — the status tool still answers from the records above.
-	const running = all.filter(([, entry]) => entry.state === "working").length;
-	if (running === 0) {
-		stopStatusTicker();
-		ui.setWidget(STATUS_KEY, undefined);
-		return;
-	}
-	// A settled row is drawn for a turn, the reference's linger, so a finished neighbour
-	// can be read beside the live one without becoming permanent furniture. A replayed row
-	// has no settledTurn and is never drawn: this turn did not run it.
-	const drawn = all.filter(
-		([, entry]) =>
-			entry.state === "working" ||
-			(entry.settledTurn !== undefined && turn - entry.settledTurn <= LINGER_TURNS),
-	);
-	const theme = ui.theme;
-	// Padded so the states and the durations line up across rows.
-	const nameWidth = Math.max(...drawn.map(([name]) => name.length));
-	const stateWidth = Math.max(...drawn.map(([, entry]) => entry.state.length));
-	const lines = [theme.fg("accent", "Subagents")];
-	drawn.forEach(([name, entry], index) => {
-		const glyph = entry.state === "working" ? "◆" : entry.state === "done" ? "✓" : "✗";
-		const color = entry.state === "working" ? "accent" : entry.state === "done" ? "success" : "error";
-		const connector = theme.fg("dim", index === drawn.length - 1 ? "└─" : "├─");
-		lines.push(
-			`${connector} ${theme.fg(color, glyph)} ${theme.fg(color, name.padEnd(nameWidth))}  ${theme.fg(color, entry.state.padEnd(stateWidth))}  ${theme.fg("dim", formatElapsed(entry.startedAt, entry.endedAt))}`,
-		);
-	});
-	// Pi spaces the widget from the editor above it but not below, so the last
-	// row would otherwise sit flush against the input box.
-	lines.push("");
-	// Above the editor, where the todo widget sits.
-	ui.setWidget(STATUS_KEY, lines, { placement: "aboveEditor" });
-	// Only a running delegation has a duration worth repainting.
-	if (statusTicker === undefined) {
-		statusTicker = setInterval(renderStatus, 1000);
-		statusTicker.unref();
-	}
-}
-
-function trackDelegation(sessionName: string, pane: string, ui: ExtensionUIContext | undefined): void {
-	// Nothing goes to the footer: the widget carries all of it, and a footer left by an
-	// earlier instance must not outlive this one. This runs once per UI, not per repaint.
-	if (ui !== undefined && ui !== statusUi) {
-		statusUi = ui;
-		ui.setStatus(STATUS_KEY, undefined);
-	}
-	// Earlier records are not cleared here: nothing retires one but the session ending,
-	// and the widget's own linger decides what is drawn.
-	delegations.set(sessionName, { startedAt: Date.now(), state: "working", pane });
-	renderStatus();
-}
-
-function settleDelegation(sessionName: string, state: "done" | "failed"): void {
-	const entry = delegations.get(sessionName);
-	// The first settle wins: the caller that observed the end is the one that knows why,
-	// and settling twice would append a second entry for one delegation.
-	if (entry === undefined || entry.endedAt !== undefined) return;
-	const endedAt = Date.now();
-	delegations.set(sessionName, { ...entry, endedAt, state, settledTurn: turn });
-	// The replay reads the last settled entry per delegation, so appending is enough.
-	entryApi?.appendEntry(SETTLED_ENTRY, { sessionName, state, endedAt } satisfies SettledEntry);
-	// A read waiting on this delegation is waiting for exactly this moment.
-	for (const resolve of settleWaiters.get(sessionName) ?? []) resolve();
-	settleWaiters.delete(sessionName);
-	renderStatus();
-}
-
-/**
- * Wait for a delegation to be over, bounded or not.
- *
- * `boundMs` bounds the wait only: nothing here stops or interrupts the child, which is
- * why an expired wait is a fact about the reader and not about the work.
- */
-async function waitForDelegation(
-	sessionName: string,
-	boundMs: number | undefined,
-	signal: AbortSignal | undefined,
-): Promise<boolean> {
-	if (delegations.get(sessionName)?.endedAt !== undefined) return true;
-	await new Promise<void>((resolve) => {
-		const waiters = settleWaiters.get(sessionName) ?? new Set<() => void>();
-		waiters.add(resolve);
-		settleWaiters.set(sessionName, waiters);
-		const stop = (): void => {
-			waiters.delete(resolve);
-			resolve();
-		};
-		if (boundMs !== undefined) {
-			const timer = setTimeout(stop, boundMs);
-			timer.unref?.();
-		}
-		signal?.addEventListener("abort", stop, { once: true });
-	});
-	return delegations.get(sessionName)?.endedAt !== undefined;
-}
-
-/** Record that a delegation's answer has already reached the parent. */
-function markReported(sessionName: string): void {
-	const entry = delegations.get(sessionName);
-	if (entry === undefined || entry.reportedAt !== undefined) return;
-	delegations.set(sessionName, { ...entry, reportedAt: Date.now() });
-}
-
-/** Whether the pushed notice would hand over an answer the parent already has. */
-function alreadyReported(sessionName: string): boolean {
-	return delegations.get(sessionName)?.reportedAt !== undefined;
-}
-
-/**
- * Keep the terminal id a delegation is known by, so a later steer can tell it is still the
- * same terminal. A delegation this session never started is not tracked, and not tracking
- * it is not a failure: the read that learned the id simply had nothing to attach it to.
- */
-function rememberTerminal(sessionName: string, terminalId: string | undefined): void {
-	if (terminalId === undefined) return;
-	const entry = delegations.get(sessionName);
-	if (entry === undefined || entry.terminalId === terminalId) return;
-	delegations.set(sessionName, { ...entry, terminalId });
-}
-
-/** The fields a replay reads; nothing else about an entry matters here. */
-type ReplayEntry = { type: string; customType?: string; data?: unknown };
-
-/**
- * Rebuild the registry from this conversation's own entries, and return the delegations
- * that were still running when the process went away.
- *
- * From the *branch*, not the whole session: `getEntries` returns every branch, so a
- * `/tree` navigation would otherwise bring back the delegations of the branch that was
- * left behind — and `resume` would accept a name from it.
- *
- * A returned entry has no watcher: the instance that armed one is gone. The caller arms
- * a fresh one, because the invariant is that a `working` record has a watcher.
- */
-async function replayDelegations(pi: ExtensionAPI, entries: readonly ReplayEntry[]): Promise<DelegationEntry[]> {
-	const started = new Map<string, DelegationEntry>();
-	const settled = new Map<string, SettledEntry>();
-	for (const entry of entries) {
-		if (entry.type !== "custom") continue;
-		if (entry.customType === DELEGATION_ENTRY) {
-			const data = entry.data as DelegationEntry;
-			started.set(data.sessionName, data);
-		}
-		if (entry.customType === SETTLED_ENTRY) {
-			const data = entry.data as SettledEntry;
-			settled.set(data.sessionName, data);
-		}
-	}
-	delegations.clear();
-	for (const [name, start] of started) {
-		const end = settled.get(name);
-		// No settledTurn: a replayed row is queryable but never drawn, because the
-		// widget's linger is about this turn, and this turn did not run it.
-		delegations.set(name, { startedAt: start.startedAt, pane: start.pane, state: end?.state ?? "working", endedAt: end?.endedAt });
-	}
-	// A delegation with no settled entry was still running when the process went away.
-	// Its pane is the only thing left that can answer for it: a pane that is gone is a
-	// failure, and one that is still there needs the caller to watch it again.
-	const resumed: DelegationEntry[] = [];
-	for (const [name, start] of started) {
-		const entry = delegations.get(name);
-		if (entry?.state !== "working") continue;
-		if (await paneIsGone(pi, entry.pane)) {
-			delegations.set(name, { ...entry, state: "failed", endedAt: Date.now() });
-		} else {
-			resumed.push(start);
-		}
-	}
-	renderStatus();
-	return resumed;
-}
-
 // ── Delegation flow ────────────────────────────────────────────────────────
 
 /** The dry-run answer: the resolved plan, with nothing started. */
@@ -788,7 +258,7 @@ function blockingResult(
 	outcome: SettleOutcome | undefined,
 	result: ChildResult | undefined,
 	notes: string[],
-): { content: { type: "text"; text: string }[]; isError: boolean } {
+): AgentToolResult<unknown> {
 	// One dimension, like the reference: how the delegation ended. The wait decides when
 	// the child produced no result at all, the child's own last turn decides otherwise,
 	// and a turn that landed no answer is its own state rather than `done`.
@@ -810,6 +280,7 @@ function blockingResult(
 		],
 		// The same single rule the widget and the notice read, not a second reading of it.
 		isError: settledState(outcome, result) === "failed",
+		details: {},
 	};
 }
 
@@ -843,14 +314,14 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	// A queued notice is cleared by identity when Pi starts delivering it, and by this
 	// net when it never does: a delivery discarded with Escape never starts.
 	pi.on("message_start", ({ message }) => {
-		if (message.role === "custom" && message.customType === "luvus-subagent-completion" && message.content === pendingNotice) {
-			pendingNotice = undefined;
+		if (message.role === "custom" && message.customType === "luvus-subagent-completion" && message.content === queuedNotice()) {
+			clearQueuedNotice();
 		}
 	});
 	pi.on("agent_settled", (_event, ctx) => {
-		if (ctx.isIdle()) pendingNotice = undefined;
+		if (ctx.isIdle()) clearQueuedNotice();
 	});
-	entryApi = pi;
+	attachEntryApi(pi);
 
 	// The session is replaced for real here: `session_shutdown` fires for a reload, a new
 	// session, a resume and a fork, and it cannot be cancelled. `session_before_switch` can
@@ -859,12 +330,8 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	// would never be cleared, and every later completion notice would be dropped.
 	pi.on("session_shutdown", () => {
 		sessionStale = true;
-		pendingNotice = undefined;
-		delegations.clear();
-		stopStatusTicker();
-		// The widget goes with the session, not with the next repaint.
-		statusUi?.setWidget(STATUS_KEY, undefined);
-		statusUi = undefined;
+		clearQueuedNotice();
+		endSession();
 	});
 
 	// A switch keeps the process alive, so the previous session's records would answer
@@ -875,10 +342,9 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		// A reload or a switch keeps the process, so this session's watchers start clean.
 		sessionStale = false;
-		turn = 0;
 		// The widget is published through a UI this instance has not seen yet: without this,
 		// a replayed row for a child that is still running would never be drawn at all.
-		statusUi = ctx.hasUI ? ctx.ui : undefined;
+		beginSession(ctx.hasUI ? ctx.ui : undefined);
 		// A delegation that outlived the instance that started it has no watcher left, so
 		// nothing would settle it, close its pane, or push its answer. Arm one here — not in
 		// `session_tree`, which shares the replay but must not re-arm.
@@ -897,7 +363,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	// A tree navigation keeps both the session and the process, and it changes which branch
 	// is active: the registry has to follow the branch the user is on now.
 	pi.on("session_tree", async (_event, ctx) => {
-		turn = 0;
+		restartTurnCount();
 		await replayDelegations(pi, ctx.sessionManager.getBranch());
 	});
 
@@ -909,7 +375,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	 */
 	pi.on("before_agent_start", (event) => {
 		// The parent turn the widget's linger is counted in.
-		turn++;
+		countTurn();
 		const agents = discoverAgents(event.systemPromptOptions.cwd);
 		if (agents.length === 0) {
 			delete event.systemPromptOptions.sections.subagent_agents;
@@ -990,6 +456,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `Unknown agent "${params.agent}". Known: ${known || "(none)"}` }],
 					isError: true,
+					details: {},
 				};
 			}
 
@@ -1007,6 +474,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 							{ type: "text", text: `${wantedResume} is still running; steer it instead of resuming it.` },
 						],
 						isError: true,
+						details: {},
 					};
 				}
 				resumeFile = sessionFileFor(wantedResume);
@@ -1019,6 +487,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 							},
 						],
 						isError: true,
+						details: {},
 					};
 				}
 			}
@@ -1031,7 +500,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				// A dry run only inspects the plan, and naming the prompt file created nothing —
 				// so there is nothing to clean up here.
 				const planText = dryRunReport(agent, args, params.task, wait, sessionName, unresolvedSkills);
-				return { content: [{ type: "text", text: planText }] };
+				return { content: [{ type: "text", text: planText }], details: {} };
 			}
 
 			// Launching is what grows the prompt directory and what decides whether a
@@ -1065,7 +534,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					settleDelegation(sessionName, "failed");
 					settled = true;
 					if (await paneIsGone(pi, pane)) {
-						markReported(sessionName);
+						recordDelivery(sessionName);
 						return blockingResult(agent.name, "gone", undefined, []);
 					}
 					return {
@@ -1078,6 +547,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 							},
 						],
 						isError: true,
+						details: {},
 					};
 				}
 				if (started.state === "queued") {
@@ -1086,7 +556,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					if (await paneIsGone(pi, pane)) {
 						settleDelegation(sessionName, "failed");
 						settled = true;
-						markReported(sessionName);
+						recordDelivery(sessionName);
 						return blockingResult(agent.name, "gone", undefined, []);
 					}
 					// Nothing proved the child took the task, but the prompt was pasted and
@@ -1118,7 +588,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					const unpicked = started.unsentInComposer
 						? `${sessionName} still has the task sitting in its input box: the paste landed, and ${presses} over ${START_CONFIRM_SECONDS}s did not submit it (${whence}). Nothing is running — steer it to press that key again, rather than sending the task a second time.`
 						: `${sessionName} did not confirm the task: it was pasted and submitted ${presses} over ${START_CONFIRM_SECONDS}s, its transcript still held no such message, and its input box is empty (${whence}). It may still be picked up, so check it or steer it instead of sending the task again; its pane is left open.`;
-					return { content: [{ type: "text", text: unpicked }], isError: true };
+					return { content: [{ type: "text", text: unpicked }], details: {}, isError: true };
 				}
 				if (wait) {
 					outcome = await waitForSettle(pi, pane);
@@ -1135,7 +605,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						"It keeps running there; the pane is visible and steerable.",
 						...notes,
 					].join("\n");
-					return { content: [{ type: "text", text: notice }] };
+					return { content: [{ type: "text", text: notice }], details: {} };
 				}
 				if (outcome === "gone") notes.push(`its pane was closed before it finished; nothing is running in pane ${pane} any more`);
 				else if (!settled) {
@@ -1154,7 +624,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				if (settled || outcome === "gone") {
 					settleDelegation(sessionName, settledState(outcome, result));
 					// The answer is in this tool result, so the watcher must not push it too.
-					markReported(sessionName);
+					recordDelivery(sessionName);
 				} else {
 					void deliverWhenSettled({
 						pi,
@@ -1221,6 +691,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 							},
 						],
 						isError: true,
+						details: {},
 					};
 				}
 				rememberTerminal(params.sessionName, seen?.terminalId);
@@ -1250,11 +721,12 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 							: verdict.unsentInComposer
 								? `${how} ${params.sessionName} — the message is sitting in its input box unsent, so steer it again to press Enter.`
 								: `${how} ${params.sessionName} — queued; the host took the message, but pickup is not confirmed.`;
-				return { content: [{ type: "text", text }] };
+				return { content: [{ type: "text", text }], details: {} };
 			} catch (error) {
 				return {
 					content: [{ type: "text", text: `Could not reach ${params.sessionName}: ${String(error)}` }],
 					isError: true,
+					details: {},
 				};
 			}
 		},
@@ -1306,6 +778,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						{ type: "text", text: "wait needs a sessionName: waiting for every delegation has no single answer." },
 					],
 					isError: true,
+					details: {},
 				};
 			}
 			const all = [...delegations.entries()];
@@ -1317,18 +790,19 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						{ type: "text", text: `No delegation named ${params.sessionName}. Known: ${known || "(none)"}` },
 					],
 					isError: true,
+					details: {},
 				};
 			}
-			if (rows.length === 0) return { content: [{ type: "text", text: "No delegations in this session." }] };
+			if (rows.length === 0) return { content: [{ type: "text", text: "No delegations in this session." }], details: {} };
 			const before = asked === undefined ? undefined : delegations.get(asked);
 			// The claim goes on before the wait: the watcher settles this delegation, and while
 			// this call is going to hand the answer over the notice must not push it too. A call
 			// that gives up takes the claim back, so the notice is the path that still delivers.
 			let expired = false;
 			if (params.wait === true && asked !== undefined && before?.endedAt === undefined) {
-				waitingReads.add(asked);
+				holdDeliveryFor(asked);
 				const over = await waitForDelegation(asked, params.timeout_ms, signal);
-				waitingReads.delete(asked);
+				releaseDeliveryHold(asked);
 				expired = !over;
 			}
 			// Everything below reads the registry again, because a wait just moved it: a row or a
@@ -1350,9 +824,9 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			// that reads a notice as "the rest of the story" is what that costs.
 			let delivered = false;
 			if (asked !== undefined && current?.state !== "working") {
-				delivered = alreadyReported(asked);
+				delivered = answerAlreadyDelivered(asked);
 				answer = readChildResult(asked);
-				if (answer !== undefined) markReported(asked);
+				if (answer !== undefined) recordDelivery(asked);
 			}
 			// Read once: the row says what the child is doing, and remembering it is what lets
 			// the next read say whether anything moved in between.
@@ -1390,6 +864,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						].join("\n"),
 					},
 				],
+				details: {},
 			};
 		},
 	});

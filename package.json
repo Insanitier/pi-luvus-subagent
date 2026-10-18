@@ -1,19 +1,35 @@
 {
-  "name": "pi-luvus-subagent",
-  "version": "0.1.0",
-  "description": "Luvus-backed subagents for Pi: agent presets from .pi/agents, visible panes, steerable, blocking or background",
-  "keywords": ["pi-package", "pi", "subagent", "luvus", "delegation"],
-  "license": "MIT",
-  "scripts": {
-    "test": "node verify.mjs"
-  },
-  "pi": {
-    "extensions": ["./extensions"]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
-  }
+	"name": "pi-luvus-subagent",
+	"version": "0.1.0",
+	"description": "Luvus-backed subagents for Pi: agent presets from .pi/agents, visible panes, steerable, blocking or background",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"subagent",
+		"luvus",
+		"delegation"
+	],
+	"license": "MIT",
+	"scripts": {
+		"test": "node verify.mjs",
+		"check": "tsc --noEmit"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "^1.3.0",
+		"@earendil-works/pi-coding-agent": "^1.3.0",
+		"@earendil-works/pi-tui": "^1.3.0",
+		"typebox": "^1.4.2",
+		"typescript": "5.6"
+	}
 }
