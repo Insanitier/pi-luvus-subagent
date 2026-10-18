@@ -49,7 +49,7 @@ export type Delegation = {
 /** How many parent turns the widget keeps a settled row, per the reference. */
 export const LINGER_TURNS = 1;
 /** The parent turn counter the linger is measured in. */
-export let turn = 0;
+let turn = 0;
 
 /**
  * The session entries the registry is rebuilt from.
@@ -63,7 +63,7 @@ export type DelegationEntry = { sessionName: string; agent: string; task: string
 export type SettledEntry = { sessionName: string; state: "done" | "failed"; endedAt: number };
 
 /** The API entries are appended through; set once at load, like the widget's UI. */
-export let entryApi: ExtensionAPI | undefined;
+let entryApi: ExtensionAPI | undefined;
 
 /**
  * One entry per delegation this session, keyed by session name — the only id the
@@ -85,14 +85,7 @@ export const delegations = new Map<string, Delegation>();
  */
 export const settleWaiters = new Map<string, Set<() => void>>();
 
-/**
- * Reads whose answer is theirs to hand over.
- *
- * While one waits, the notice for the same settle would be the same text twice, and a
- * parent blocked on that read is already awake. A read that gives up — an expired bound,
- * an interrupted parent — takes the claim back before its wait returns, so the watcher's
- * notice is still the path that delivers.
- */
+/** The UI the widget is published through, and the ticker that repaints it while it runs. */
 let statusUi: ExtensionUIContext | undefined;
 let statusTicker: ReturnType<typeof setInterval> | undefined;
 
@@ -250,6 +243,18 @@ export async function waitForDelegation(
 		signal?.addEventListener("abort", stop, { once: true });
 	});
 	return delegations.get(sessionName)?.endedAt !== undefined;
+}
+
+/**
+ * Remember what a read saw, so the next one can say what changed in between.
+ *
+ * The read path records this and nothing else: `lastRead` is not a field a caller may write,
+ * because the whole point of it is that both sides read the same value.
+ */
+export function rememberRead(sessionName: string, read: { at: number; toolUses: number }): void {
+	const entry = delegations.get(sessionName);
+	if (entry === undefined) return;
+	delegations.set(sessionName, { ...entry, lastRead: read });
 }
 
 /** Record that a delegation's answer has already reached the parent. */

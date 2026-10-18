@@ -19,7 +19,7 @@ import { Type } from "typebox";
 import { installStateReporter } from "./luvus-subagent/state-reporter.ts";
 import { answerAlreadyDelivered, clearQueuedNotice, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation } from "./luvus-subagent/delivery.ts";
 import { capCompletion, settledState, waitExpiredNote } from "./luvus-subagent/outcome.ts";
-import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberTerminal, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./luvus-subagent/registry.ts";
+import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberRead, rememberTerminal, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./luvus-subagent/registry.ts";
 import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./luvus-subagent/agents.ts";
 import { type ChildResult, readChildProgress, readChildResult, sessionFileFor } from "./luvus-subagent/child-session.ts";
 import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, luvusBinary, paneIsGone, pressKey, readPane, stateAuthority, waitForSettle } from "./luvus-subagent/luvus.ts";
@@ -577,7 +577,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 				return entry.state === "working" ? `${head}\n${progressLine(progress, since)}` : head;
 			});
 			if (asked !== undefined && progress !== undefined && current !== undefined) {
-				delegations.set(asked, { ...current, lastRead: { at: Date.now(), toolUses: progress.toolUses } });
+				rememberRead(asked, { at: Date.now(), toolUses: progress.toolUses });
 			}
 			// A parent that asks again for an answer it already has is pointed at it rather than
 			// handed the same words twice: the notice carries them above, and the child's session

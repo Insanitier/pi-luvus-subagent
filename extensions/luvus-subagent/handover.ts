@@ -107,14 +107,16 @@ export async function taskSitsUnsent(pi: ExtensionAPI, sessionName: string, task
 	return read.text.includes(task.slice(0, TASK_MARK_IN_PANE_CHARS));
 }
 /**
- * A handover in words, for the tool that asked for it.
+ * One message's handover, in words: what was done to this child, and what it made of it.
  *
- * Four answers, and they call for four different moves: the child has it, the host refused
- * it and said why, it is sitting unsent in the input box (the Enters did not land — steer
- * again to press Enter), or the host took it but nothing proves pickup yet.
+ * Four answers, and they call for four different moves: the child has it, the host refused it
+ * and said why, it is sitting unsent in the input box (the Enters did not land — steer again
+ * to press Enter), or the host took it but nothing proves pickup yet.
  *
- * `verb` is what the caller did to get here — a fresh message and an interrupting one read
- * differently to whoever asks next.
+ * What both callers share is the four states themselves (`Handover`), not these sentences: a
+ * launch words the same states with what only a launch knows — whether its pane still exists,
+ * and that nothing is running — so it composes its own. `verb` is what this caller did to get
+ * here, because a fresh message and an interrupting one read differently to whoever asks next.
  */
 export function handoverText(verdict: Handover, target: string, verb: string): string {
 	if (verdict.state === "taken") return `${verb} ${target}, and it is working.`;
