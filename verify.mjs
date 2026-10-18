@@ -973,6 +973,16 @@ const plan = await tools.delegate.execute(
 );
 const planText = plan.content[0].text;
 check("dry_run reports the resolved argv", planText.includes("argv:    pi ") && planText.includes("--no-skills"), planText);
+// The child is told to load this extension by path, and that path has to be the entry Pi
+// loaded — not whichever file happens to compute it. A wrong path here is silent: the child
+// starts without a reporter, so its pane never reports `done` and every blocking wait runs
+// to its full timeout, with nothing in the transcript to say why.
+const extensionArg = /--extension (\S+)/.exec(planText)?.[1];
+check(
+	"the child is pointed at the entry file that exists",
+	extensionArg !== undefined && existsSync(extensionArg) && extensionArg.endsWith("luvus-subagent.ts"),
+	String(extensionArg),
+);
 check(
 	"dry_run starts nothing",
 	readFileSync(STUB_LOG, "utf-8").length === logBefore,
