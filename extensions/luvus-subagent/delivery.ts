@@ -13,12 +13,16 @@
  *
  * The notice is the fallback for a parent that neither asked nor waited. A notice the cap cut
  * short is not a delivery: the answer stays pullable, and `sendNotice` says which it was.
+ *
+ * When a delegation is over is decided here too, because "over" is what delivery waits for: a
+ * finished state is watched for its own window before anything is recorded or handed over, so
+ * a child that goes back to work — a retry, a continuation — is never reported as finished.
  */
 import { rmSync } from "node:fs";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
-import { readChildResult } from "./child-session.ts";
-import { WAIT_FLOOR_MS, closePane, waitForSettle, type SettleOutcome } from "./luvus.ts";
+import { readChildProgress, readChildResult, type ChildResult } from "./child-session.ts";
+import { START_POLL_MS, WAIT_FLOOR_MS, closePane, paneIsGone, paneState, waitForSettle, type SettleOutcome } from "./luvus.ts";
 import { COLLAPSED_LINES, COMPLETION_OUTPUT_CAP, capCompletion, endedOf, outcomeLine, settledState, shownResult } from "./outcome.ts";
 import { alreadyReported, delegations, markReported, settleDelegation } from "./registry.ts";
 /**
@@ -105,6 +109,80 @@ export function registerCompletionRenderer(pi: ExtensionAPI): void {
 	});
 }
 
+/**
+ * How long a finished state has to hold before it is the end of the delegation.
+ *
+ * A terminal state is a report, not a conclusion. A child reports the end of a *turn*, and that
+ * is not the same thing as the delegation being over: an extension that retries a failed turn
+ * (`pi-retry` and its kin) re-runs it in the same pane seconds later, and one that continues a
+ * finished agent does the same thing on purpose. Measured against a real retry extension, a
+ * child that errored on a dropped connection answered normally two seconds later — while this
+ * extension had already recorded it failed and closed the pane that retry needed.
+ *
+ * So the state is watched rather than believed: nothing is recorded, delivered or closed until
+ * it has held for this window with no new writing and no return to `working`. The cost is that
+ * a delegation is reported this much later than the child finished; the gain is that "done"
+ * means the child stopped, which is what every reader of a state here assumes it means.
+ */
+const QUIESCENCE_WINDOW_MS = 30_000;
+/**
+ * The window above, overridable only so the checks need not wait half a minute per case.
+ *
+ * Zero is a legal value and means "take the state as reported": a suite that had to spend the
+ * window on every delegation in it would be testing this window instead of what it asked about.
+ */
+function quiescenceMs(): number {
+	const configured = process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS;
+	if (configured === undefined) return QUIESCENCE_WINDOW_MS;
+	const window = Number(configured);
+	return Number.isFinite(window) && window >= 0 ? window : QUIESCENCE_WINDOW_MS;
+}
+/**
+ * Watch a finished state for the child starting again.
+ *
+ * Two signals, because neither is enough alone: the child's transcript, because a retry writes
+ * and a child that has only lost its connection has written nothing; and the pane's own state,
+ * because a continuation may start before it has anything to say. `continued` means the child
+ * is working again and the wait resumes; `quiet` means the state held, which is what makes it
+ * final; `gone` is a pane that went away underneath it; `stale` is this session being torn
+ * down, which has no next turn to deliver to.
+ */
+export async function awaitQuiescence(
+	pi: ExtensionAPI,
+	sessionName: string,
+	pane: string,
+	isStale: () => boolean,
+): Promise<"continued" | "quiet" | "gone" | "stale"> {
+	const window = quiescenceMs();
+	if (window === 0) return "quiet";
+	const baseline = readChildProgress(sessionName)?.lastWriteAt ?? Date.now();
+	const deadline = Date.now() + window;
+	for (;;) {
+		if (isStale()) return "stale";
+		if (Date.now() >= deadline) return "quiet";
+		await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
+		const progress = readChildProgress(sessionName);
+		if (progress?.lastWriteAt !== undefined && progress.lastWriteAt > baseline) return "continued";
+		if ((await paneState(pi, pane)) === "working") return "continued";
+		if (await paneIsGone(pi, pane)) return "gone";
+	}
+}
+/**
+ * What a parent is told when a child reported a finished turn and then went back to work.
+ *
+ * It carries no answer — an answer that may still arrive is not an answer — and it names what
+ * would move the child, because a parent blocked on something that has not moved needs one.
+ */
+export function wentBackToWorkNote(): string {
+	return "It reported its turn as finished, and then started working again before that state had held, so it is still running and stays watched with its pane open. Waiting again will not speed that up — steer it (interrupt: true makes it wrap up now) if you want it to move, or tell the user it looks stuck.";
+}
+/**
+ * Watch a background child to completion and hand its result to the parent.
+ *
+ * Detached on purpose: the delegation has already returned, so nothing awaits this promise.
+ * Messaging the session is what tells the parent the child is done, so this is the only
+ * delivery path a background delegation has.
+ */
 export type SettleWatch = {
 	pi: ExtensionAPI;
 	pane: string;
@@ -119,20 +197,34 @@ export async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 	// The registry owns the start time, so the notice and the widget agree.
 	const startedAt = delegations.get(sessionId)?.startedAt ?? Date.now();
 	let outcome: SettleOutcome = "timeout";
+	let result: ChildResult | undefined;
 	try {
-		// A wait that ran out is not the child's end, so the watcher keeps watching until
-		// it settles or its pane dies: a long task is never recorded as finished while it
-		// is still running. The floor stops a wait that fails at once from spinning.
+		// Two loops, one rule: nothing records this delegation as over until something says the
+		// child itself is. The inner one waits out a wait that ran out, because a long task must
+		// not be recorded as finished while it runs; the outer one gives an errored turn its retry
+		// window, and goes back to waiting when the child starts working again.
 		for (;;) {
-			const cycleStart = Date.now();
-			outcome = await waitForSettle(pi, pane);
-			if (outcome !== "timeout" || isStale()) break;
-			const spent = Date.now() - cycleStart;
-			// A wait that failed at once is not the child's end: wait out the floor and watch
-			// again, rather than leave a `working` record that nothing will ever settle.
-			if (spent < WAIT_FLOOR_MS) await new Promise((resolve) => setTimeout(resolve, WAIT_FLOOR_MS - spent));
+			// A wait that ran out is not the child's end, so the watcher keeps watching until
+			// it settles or its pane dies: a long task is never recorded as finished while it
+			// is still running. The floor stops a wait that fails at once from spinning.
+			for (;;) {
+				const cycleStart = Date.now();
+				outcome = await waitForSettle(pi, pane);
+				if (outcome !== "timeout" || isStale()) break;
+				const spent = Date.now() - cycleStart;
+				// A wait that failed at once is not the child's end: wait out the floor and watch
+				// again, rather than leave a `working` record that nothing will ever settle.
+				if (spent < WAIT_FLOOR_MS) await new Promise((resolve) => setTimeout(resolve, WAIT_FLOOR_MS - spent));
+			}
+			result = readChildResult(sessionId);
+			// A finished state is watched, not believed: the child may be about to retry an errored
+			// turn or to continue one it reported as done. Nothing is settled and nothing is
+			// delivered until the window says the state held.
+			if (outcome === "timeout") break;
+			const verdict = await awaitQuiescence(pi, sessionId, pane, isStale);
+			if (verdict === "stale") return;
+			if (verdict !== "continued") break;
 		}
-		const result = readChildResult(sessionId);
 		// A closed pane is a delegation that ended without finishing; a wait that ran out
 		// leaves a child that is still working, which is not a failure and not an end.
 		// The one rule, computed once: the settle entry, the widget and the notice's glyph

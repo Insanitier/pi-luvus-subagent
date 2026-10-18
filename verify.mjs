@@ -19,7 +19,7 @@
  * real pane. Run it with `node verify.mjs` (or `npm test`).
  */
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -60,6 +60,12 @@ registerHooks({
 });
 
 // ── 1. A throwaway HOME, so the extension's own paths stay out of the way ────
+// A finished state is watched for a window before it counts as the end of a delegation, because
+// the child may yet retry an errored turn or continue a finished one. That window is measured in
+// seconds, which is right for a child and wrong for a suite — so it is nearly zero here, and the
+// checks that are about the window itself set their own. Everything else is about what happens
+// *after* an end, and reads the same either way.
+process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS = "0";
 const HOME = join(tmpdir(), `luvus-verify-${process.pid}`);
 const AGENT_DIR = join(HOME, ".pi", "agent");
 const SESSION_DIR = join(AGENT_DIR, "subagent-sessions");
@@ -387,15 +393,18 @@ const result = await tools.delegate.execute(
 const text = result.content[0].text;
 check("tool result carries the child's answer", text.includes("STUB_ANSWER"), text.slice(0, 120));
 check("tool result reports the agent and status", text.startsWith("fixture-bare (done):"));
-// The launch reply already carried `ready` and `status`, so nothing may look the child's
-// state up again: a second lookup is what Luvus' guidance warns against, and what used to
-// decide a delegation had not started before the child could even finish booting.
+// The launch reply already carried `ready` and `status`, so nothing may look the child's state up
+// to decide it started: a second lookup is what Luvus' guidance warns against, and what used to
+// decide a delegation had not started before the child could even finish booting. A lookup later
+// on is a different question — whether a child that reported a finished turn is working again —
+// so the check is scoped to the launch itself.
 const callLog = readFileSync(STUB_LOG, "utf-8").slice(callLogBefore).trim().split("\n");
+const firstPrompt = callLog.findIndex((line) => line.startsWith("agent prompt "));
 check(
 	"the launch reply is the only status read",
 	callLog[0].startsWith("agent start ") &&
-		callLog.some((line) => line.startsWith("agent prompt ")) &&
-		!callLog.some((line) => line.startsWith("agent get ")),
+		firstPrompt > 0 &&
+		!callLog.slice(0, firstPrompt).some((line) => line.startsWith("agent get ")),
 	callLog.join(" | "),
 );
 
@@ -967,6 +976,77 @@ check(
 		errored.content[0].text.includes("the task did not finish"),
 	errored.content[0].text,
 );
+
+// The window is what makes "done" mean the child stopped. Two cases carry the whole reason it
+// exists: a turn that failed and is retried a second later, and a turn that finished and was
+// continued. The child's own transcript gaining a write is how both announce themselves.
+console.log("\nconfirming a finished state");
+/** The child's session file, which the stub writes one turn into. */
+const childSession = (name) => join(SESSION_DIR, `1970-01-01T00-00-00-000Z_${name}.jsonl`);
+/** One more finished turn, as a retry or a continuation would write it. */
+const writeAnotherTurn = (name, answer) =>
+	appendFileSync(
+		childSession(name),
+		[
+			"",
+			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "and now this" }] } }),
+			JSON.stringify({
+				type: "message",
+				message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: answer }] },
+			}),
+		].join("\n"),
+	);
+/** The session name the tool just reported, so the retry lands in that child's transcript. */
+const nameIn = (result) => /fixture-bare-[0-9a-f]{6}/.exec(result.content[0].text)?.[0];
+
+// A window a real child would have, shortened so the check need not wait half a minute.
+process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS = "2500";
+const watched = [
+	{ log: "verify-retried", task: "ERRORED_TASK", answer: "STUB_ANSWER_AFTER_RETRY" },
+	{ log: "verify-continued", task: "say the thing", answer: "STUB_ANSWER_CONTINUED" },
+];
+// The previous batch has to go out first, or these two notices ride along with it and
+// nothing reaches `notices` at all.
+await deliverQueued();
+notices.length = 0;
+const windowsLog = readFileSync(STUB_LOG, "utf-8").length;
+const windowed = [];
+for (const one of watched) {
+	const started = await tools.delegate.execute(one.log, { agent: "fixture-bare", task: one.task, wait: false }, undefined, undefined, ctx);
+	windowed.push({ ...one, name: nameIn(started) });
+	setTimeout(() => writeAnotherTurn(nameIn(started), one.answer), 900);
+}
+// Long enough for the write to be noticed (about a second) and for the state to then hold its
+// whole window (2.5s), which is what settles it for real.
+await new Promise((resolve) => setTimeout(resolve, 7000));
+const windowLog = readFileSync(STUB_LOG, "utf-8").slice(windowsLog);
+check(
+	"a child that starts working again is waited for, not recorded as finished",
+	// Two waits per delegation: the one that reported the end, and the one after it resumed.
+	windowLog.split("\n").filter((line) => line.startsWith("wait agent-status")).length === 4 &&
+		windowLog.split("pane close").length - 1 === 2,
+	windowLog.replace(/\n/g, " | "),
+);
+const windowNotices = notices.map((notice) => noticeText(notice));
+check(
+	"only the answer that survived the window is delivered, and only once",
+	// Once each: the answer that survived, never the turn it replaced. Other delegations in
+	// this window settle on their own schedule, so this asks about these two by name rather
+	// than about the count — a watcher from an earlier check may push a notice here too.
+	windowed.every((one) => windowNotices.filter((text) => text.includes(one.answer)).length === 1) &&
+		!windowNotices.some((text) => text.includes("(error")),
+	windowNotices.join(" || "),
+);
+const windowRows = (await tools.subagent_status.execute("verify-window-read", {}, undefined, undefined, ctx)).content[0].text;
+check(
+	"the rows agree with the notices about how it ended",
+	// Both ended `done`: neither was ever recorded as failed, which is what a finished state
+	// taken at face value would have written before the retry and the continuation arrived.
+	windowed.every((one) => new RegExp(`${one.name}\\s+done`).test(windowRows)),
+	windowRows,
+);
+process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS = "0";
+
 // An interrupted turn that had already written its answer keeps that answer: the
 // provider's "Operation aborted" line must not outrank what the turn produced.
 const aborted = await tools.delegate.execute("verify-aborted", { agent: "fixture-bare", task: "ABORTED_WITH_OUTPUT_TASK" }, undefined, undefined, ctx);

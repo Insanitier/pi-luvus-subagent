@@ -17,7 +17,7 @@ import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent"
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { installStateReporter } from "./luvus-subagent/state-reporter.ts";
-import { answerAlreadyDelivered, clearQueuedNotice, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation } from "./luvus-subagent/delivery.ts";
+import { answerAlreadyDelivered, awaitQuiescence, clearQueuedNotice, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation, wentBackToWorkNote } from "./luvus-subagent/delivery.ts";
 import { capCompletion, settledState, waitExpiredNote } from "./luvus-subagent/outcome.ts";
 import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberRead, rememberTerminal, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./luvus-subagent/registry.ts";
 import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./luvus-subagent/agents.ts";
@@ -366,6 +366,26 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					);
 				}
 				const result = readChildResult(sessionName);
+				// A finished state is watched, not believed — the child may be about to retry an
+				// errored turn or to continue one it reported as done, and both happen in this pane.
+				// The wait stops blocking either way; what changes is that nothing is settled, and
+				// nothing is delivered, until the state has held.
+				if (outcome === "settled") {
+					const verdict = await awaitQuiescence(pi, sessionName, pane, () => sessionStale);
+					if (verdict === "continued") {
+						settled = false;
+						void deliverWhenSettled({
+							pi,
+							pane,
+							sessionId: sessionName,
+							agentName: agent.name,
+							promptFile,
+							isStale: () => sessionStale,
+						});
+						// No answer in this result: it says what the child is doing, not what it said.
+						return blockingResult(agent.name, "timeout", undefined, [wentBackToWorkNote()]);
+					}
+				}
 				// A child that outlived the wait is still working: hand it to the watcher, so
 				// its answer still arrives and its pane still gets closed once it settles.
 				// Without this the delegation falls between the two modes and is abandoned.

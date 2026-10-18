@@ -148,6 +148,29 @@ export type SettleOutcome = "settled" | "timeout" | "gone";
  * `callLuvus` turns into a throw — so the envelope is read here. Only a definite
  * `not_found` counts: a Luvus that cannot be reached has not said the pane is gone.
  */
+/**
+ * The state a pane reports right now, or `undefined` when it cannot be read.
+ *
+ * `agent get` is the wrong way to decide a delegation is over — measured, a child reports
+ * `working` while it is still drawing its banner — but it is the right way to notice that a
+ * child which reported a finished turn is working again.
+ */
+export async function paneState(pi: ExtensionAPI, pane: string): Promise<string | undefined> {
+	const probe = await pi
+		.exec(luvusBinary(), ["agent", "get", pane], { timeout: PANE_PROBE_TIMEOUT_MS })
+		.catch(() => undefined);
+	if (probe === undefined || probe.killed) return undefined;
+	try {
+		const envelope = JSON.parse(probe.stdout.trim()) as {
+			result?: { status?: unknown };
+			error?: { code?: string };
+		};
+		if (envelope.error !== undefined) return undefined;
+		return typeof envelope.result?.status === "string" ? envelope.result.status : undefined;
+	} catch {
+		return undefined;
+	}
+}
 export async function paneIsGone(pi: ExtensionAPI, pane: string): Promise<boolean> {
 	const probe = await pi
 		.exec(luvusBinary(), ["agent", "get", pane], { timeout: PANE_PROBE_TIMEOUT_MS })
