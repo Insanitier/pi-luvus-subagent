@@ -11,7 +11,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
 	CONFIG_DIR_NAME,
@@ -25,9 +25,39 @@ import {
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { installStateReporter } from "./luvus-subagent/state-reporter.ts";
+import {
+	type ChildOutcome,
+	type ChildProgress,
+	type ChildResult,
+	readChildProgress,
+	readChildResult,
+	sessionFileFor,
+	taskInTranscript,
+	TASK_MARK_IN_PANE_CHARS,
+} from "./luvus-subagent/child-session.ts";
+import {
+	type Launch,
+	type SettleOutcome,
+	PROMPT_SUBMIT_TIMEOUT_MS,
+	START_CONFIRM_SECONDS,
+	START_POLL_MS,
+	STEER_CONFIRM_SECONDS,
+	WAIT_FLOOR_MS,
+	WAIT_SECONDS,
+	callLuvus,
+	closePane,
+	LuvusError,
+	luvusBinary,
+	paneIsGone,
+	pressKey,
+	readPane,
+	startChild,
+	stateAuthority,
+	waitForSettle,
+} from "./luvus-subagent/luvus.ts";
 import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./luvus-subagent/agents.ts";
 import { installRawPaste } from "./luvus-subagent/editor.ts";
-import { DELEGATION_ENTRY, SESSION_DIR, SETTLED_ENTRY, SUBAGENT_CHILD_FLAG, isDirectory } from "./luvus-subagent/env.ts";
+import { DELEGATION_ENTRY, SETTLED_ENTRY, SUBAGENT_CHILD_FLAG } from "./luvus-subagent/env.ts";
 import { sweepExpiredPrompts, sweepOrphanSessions } from "./luvus-subagent/sweeps.ts";
 // The pieces the checks drive by name. They live in modules now; the entry keeps the
 // names stable, because a check that reaches into a moved file is a check that has to
@@ -35,261 +65,12 @@ import { sweepExpiredPrompts, sweepOrphanSessions } from "./luvus-subagent/sweep
 export { discoverAgents, prepareLaunch, writePromptFile } from "./luvus-subagent/agents.ts";
 
 
-// ── Discovery ──────────────────────────────────────────────────────────────
 
-
-// ── Luvus CLI ──────────────────────────────────────────────────────────────
-
-/** The CLI inherits `LUVUS_SOCKET_PATH`; the extension never opens the socket itself. */
-const luvusBinary = (): string => process.env.LUVUS_BIN_PATH?.trim() || "luvus";
-
-/** How long a blocking delegation waits for the child before giving up. */
-const WAIT_SECONDS = 900;
-/**
- * The shortest gap between two watcher cycles.
- *
- * A wait that returns sooner than this did not run out, it failed. Re-arming at once
- * would spin, so the watcher waits out the floor — but it does not give up, because a
- * `working` record with no watcher is one nothing will ever settle.
- */
-const WAIT_FLOOR_MS = 1_000;
-/** How long a pane gets to close before it is left alone. */
-const PANE_CLOSE_TIMEOUT_MS = 15_000;
-
-/** How long a single key press gets to reach the child. */
-const KEYSTROKE_TIMEOUT_MS = 15_000;
-/** How long `agent prompt` gets to paste the task into the child's editor. */
-const PROMPT_SUBMIT_TIMEOUT_MS = 30_000;
-/** How often the child's transcript is read while it decides to take the task. */
-const START_POLL_MS = 1_000;
-
-/** How much of a task is matched against the child's transcript. */
-const TASK_MARK_CHARS = 64;
-
-/** How much of a CLI's stderr is quoted back when its reply is unreadable. */
-const STDERR_TAIL_CHARS = 200;
-
-/** How long a fresh child gets to write the task into its transcript. Measured: a second. */
-const START_CONFIRM_SECONDS = 15;
-
-/** How long a steer to a busy child waits for the host to see it picked the message up. */
-const STEER_CONFIRM_SECONDS = 15;
-
-const AGENT_START_TIMEOUT_MS = 120_000;
-
-/** How long the child gets to come up before `agent start` gives up. */
-const READY_TIMEOUT_SECONDS = 90;
-
-type LuvusReply = {
-	result: Record<string, unknown>;
-	/** Non-zero means the CLI refused or timed out; callers decide whether that is fatal. */
-	code: number;
-};
-
-/**
- * A refusal from the host, carrying the code it used.
- *
- * The code is the part worth keeping: `agent_not_running` means the pane is gone, while a
- * refusal with no code is a pane that is there and declined what was sent. A caller that
- * folds the two into one message sends a parent looking for a terminal that no longer
- * exists.
- */
-class LuvusError extends Error {
-	readonly code: string | undefined;
-
-	constructor(message: string, code: string | undefined) {
-		super(message);
-		this.name = "LuvusError";
-		this.code = code;
-	}
-}
-
-/**
- * One Luvus CLI call.
- *
- * Luvus answers every command with `{id, result}` or `{id, error}`. A structured
- * error is thrown here because no caller can proceed past one; a non-zero exit
- * is handed back instead, because a wait that timed out is an outcome, not a bug.
- */
-async function callLuvus(pi: ExtensionAPI, args: string[], timeoutMs: number): Promise<LuvusReply> {
-	const exec = await pi.exec(luvusBinary(), args, { timeout: timeoutMs });
-	const label = `luvus ${args[0]}${args[1] === undefined ? "" : ` ${args[1]}`}`;
-	if (exec.killed) throw new Error(`${label}: timed out after ${Math.round(timeoutMs / 1000)}s`);
-
-	const stdout = exec.stdout.trim();
-	if (stdout.length === 0) {
-		// Some commands (`wait …`) answer with the exit code alone.
-		return { result: {}, code: exec.code };
-	}
-	let envelope: { result?: Record<string, unknown>; error?: { message?: string; code?: string } };
-	try {
-		envelope = JSON.parse(stdout) as typeof envelope;
-	} catch {
-		const tail = exec.stderr.trim().slice(-STDERR_TAIL_CHARS);
-		throw new Error(`${label}: unreadable reply${tail.length > 0 ? ` (${tail})` : ""}`);
-	}
-	if (envelope.error !== undefined) {
-		throw new LuvusError(
-			`${label}: ${envelope.error.message ?? envelope.error.code ?? "failed"}`,
-			typeof envelope.error.code === "string" ? envelope.error.code : undefined,
-		);
-	}
-	return { result: envelope.result ?? {}, code: exec.code };
-}
-
-/**
- * What `agent start` says about the pane it just brought up.
- *
- * The status rides along because this reply is the only reading taken while the agent
- * is known to be ready: Luvus answers it once readiness is established, and its own
- * guidance is to accept it instead of looking the state up again (see
- * `submitAndConfirm`).
- */
-type Launch = { pane: string; status: string | undefined };
-
-/** A child pane's id, or "" when the CLI named none. */
-async function startChild(pi: ExtensionAPI, sessionName: string, args: string[]): Promise<Launch> {
-	const started = await callLuvus(
-		pi,
-		// `--auto` lets Luvus pick the split direction, so a fourth child can land below
-		// or above instead of the panes marching sideways forever.
-		["agent", "start", sessionName, "--kind", "pi", "--auto", "--timeout", String(READY_TIMEOUT_SECONDS), "--", ...args],
-		AGENT_START_TIMEOUT_MS,
-	);
-	return {
-		pane: typeof started.result.pane === "string" ? started.result.pane : "",
-		status: typeof started.result.status === "string" ? started.result.status : undefined,
-	};
-}
-
-async function pressKey(pi: ExtensionAPI, sessionName: string, key: string): Promise<void> {
-	await callLuvus(pi, ["agent", "keys", sessionName, key], KEYSTROKE_TIMEOUT_MS);
-}
-
-/** A pane probe is one fast read; a Luvus that hangs must not stall a delegation. */
-const PANE_PROBE_TIMEOUT_MS = 10_000;
-
-/** How a wait ended. `gone` is not a timeout: no state will ever arrive for that pane. */
-type SettleOutcome = "settled" | "timeout" | "gone";
-
-/**
- * Whether a delegation's pane still exists.
- *
- * Luvus answers a missing target with an error envelope and a non-zero exit, which
- * `callLuvus` turns into a throw — so the envelope is read here. Only a definite
- * `not_found` counts: a Luvus that cannot be reached has not said the pane is gone.
- */
-async function paneIsGone(pi: ExtensionAPI, pane: string): Promise<boolean> {
-	const probe = await pi
-		.exec(luvusBinary(), ["agent", "get", pane], { timeout: PANE_PROBE_TIMEOUT_MS })
-		.catch(() => undefined);
-	if (probe === undefined || probe.killed) return false;
-	try {
-		const envelope = JSON.parse(probe.stdout.trim()) as { error?: { code?: string } };
-		return envelope.error?.code === "not_found";
-	} catch {
-		return false;
-	}
-}
-
-/**
- * How a child ended: settled, still running, or its pane gone.
- *
- * The window is the blocking delegation's own and is not the caller's to shorten: a
- * wait that returns before the child is done is what a poll loop is made of.
- *
- * Luvus reports both endings with exit code 2: a closed pane prints `pane not found` on
- * stderr, an expired wait prints nothing at all (both measured). Reading that difference
- * would mean matching human text — which is localized, and which `--json` does not turn
- * into an error envelope here, `wait` rejecting the flag as a usage error. So a non-zero
- * result asks the pane itself: a closed pane answers at once, and reading that as "still
- * running" is what leaves a parent counting for nothing.
- *
- * A wait also has to be addressed by pane id: `wait agent-status <name>` is a usage error
- * (measured). Pane ids are small integers the host reuses after a close, which is why
- * identity is fenced where a message is actually sent — see `steerSubagent`.
- */
-async function waitForSettle(pi: ExtensionAPI, pane: string): Promise<SettleOutcome> {
-	const done = await callLuvus(
-		pi,
-		["wait", "agent-status", pane, "--status", "done", "--timeout", String(WAIT_SECONDS)],
-		(WAIT_SECONDS + 30) * 1000,
-	);
-	if (done.code === 0) return "settled";
-	return (await paneIsGone(pi, pane)) ? "gone" : "timeout";
-}
-
-async function closePane(pi: ExtensionAPI, pane: string): Promise<void> {
-	try {
-		await callLuvus(pi, ["pane", "close", pane], PANE_CLOSE_TIMEOUT_MS);
-	} catch {
-		// A pane that outlives its delegation is clutter, not a failure.
-	}
-}
-
-/** A string field of a reply that arrived as unknown shape, or undefined. */
-function stringField(source: unknown, key: string): string | undefined {
-	if (typeof source !== "object" || source === null) return undefined;
-	const value = (source as Record<string, unknown>)[key];
-	return typeof value === "string" ? value : undefined;
-}
-
-/** One read of a pane: what it shows, and which terminal instance is showing it. */
-type PaneRead = { text: string; terminalId: string | undefined };
-
-/**
- * Read a pane's text, and the identity of the terminal showing it.
- *
- * The terminal id is the only handle that survives a pane id being reused: `pane` is a
- * small integer the host hands out again after a close, while `terminal_id` names the
- * instance. It is read on the paths that come later rather than at launch — a pane this
- * delegation started seconds ago cannot be somebody else's yet.
- */
-async function readPane(pi: ExtensionAPI, target: string): Promise<PaneRead | undefined> {
-	const read = await callLuvus(pi, ["agent", "read", target], PANE_PROBE_TIMEOUT_MS).catch(() => undefined);
-	if (read === undefined) return undefined;
-	return { text: stringField(read.result, "text") ?? "", terminalId: stringField(read.result, "terminal_id") };
-}
-
-/**
- * Who is claiming the pane's state, in the host's own words.
- *
- * `agent explain` is the evidence behind a status, which is what a parent needs when the
- * status is surprising: `integration_report` is the child's own reporter speaking, while
- * `command_fallback` or `screen_text` is Luvus guessing at what the pane draws. Measured
- * live: a child still drawing its banner was reported `working` by a guess — and without
- * this the failure message passes that guess on as a fact.
- */
-async function stateAuthority(pi: ExtensionAPI, target: string): Promise<string | undefined> {
-	const explained = await callLuvus(pi, ["agent", "explain", target], PANE_PROBE_TIMEOUT_MS).catch(
-		() => undefined,
-	);
-	if (explained === undefined) return undefined;
-	const evidence = explained.result.state_evidence;
-	const source = stringField(evidence, "source") ?? stringField(explained.result.authority, "source");
-	if (source === undefined) return undefined;
-	const confidence = stringField(evidence, "confidence");
-	return confidence === undefined ? source : `${source} (${confidence})`;
-}
 
 
 // ── Result from the child's own session ────────────────────────────────────
 
 /** Stop reasons that mean the assistant message is final rather than intermediate. */
-const TERMINAL_STOP_REASONS = new Set(["stop", "endTurn", "length", "error", "aborted"]);
-
-/**
- * How a child's last turn ended, as a closed set.
- *
- * Pi reports no finer cause than `stopReason`, and the provider's own words ride along
- * in `errorMessage` — so this never guesses at one. `no-answer` and `pane closed` are
- * not turn outcomes but delegation ones: the first is a child that settled without
- * writing anything, the second a pane that stopped existing.
- */
-type ChildOutcome = "done" | "truncated" | "aborted" | "error" | "no-answer" | "pane closed" | "still running";
-
-type ChildResult = { status: "completed" | "failed"; text: string; outcome: ChildOutcome };
-
 /**
  * The word and the parenthetical note for one outcome.
  *
@@ -323,133 +104,6 @@ function outcomeLine(outcome: ChildOutcome): { word: string; note: string } {
 		default:
 			return { word: "done", note: "" };
 	}
-}
-/**
- * The file Pi wrote for one child session, or undefined when there is none.
- *
- * Pi names a session file `<timestamp>_<sessionId>.jsonl`; the pinned id is
- * the suffix, so this names one child exactly.
- */
-function sessionFileFor(sessionId: string): string | undefined {
-	if (!isDirectory(SESSION_DIR)) return undefined;
-	const name = readdirSync(SESSION_DIR).find((entry) => entry.endsWith(`_${sessionId}.jsonl`));
-	if (name === undefined) return undefined;
-	return join(SESSION_DIR, name);
-}
-
-/**
- * Read the child's answer from the session file it wrote.
- *
- * Reading the session beats scraping the pane: the pane holds a rendered TUI
- * (borders, status bars, spinners) and only the visible tail, while the session
- * holds the complete message with a terminal stop reason.
- */
-function readChildResult(sessionId: string): ChildResult | undefined {
-	const filePath = sessionFileFor(sessionId);
-	if (filePath === undefined) return undefined;
-
-	let terminal: { text: string; stopReason: string; errorMessage?: string } | undefined;
-	for (const line of readFileSync(filePath, "utf-8").split("\n")) {
-		if (line.trim().length === 0) continue;
-		let entry: unknown;
-		try {
-			entry = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		const message = (entry as { type?: string; message?: Record<string, unknown> }).message;
-		if ((entry as { type?: string }).type !== "message" || message === undefined) continue;
-		if (message.role !== "assistant") continue;
-		const stopReason = message.stopReason;
-		if (typeof stopReason !== "string" || !TERMINAL_STOP_REASONS.has(stopReason)) continue;
-		const content = Array.isArray(message.content) ? message.content : [];
-		const text = content
-			.filter((part): part is { type: string; text: string } => {
-				const candidate = part as { type?: unknown; text?: unknown };
-				return candidate.type === "text" && typeof candidate.text === "string";
-			})
-			.map((part) => part.text)
-			.join("");
-		terminal = {
-			text,
-			stopReason,
-			errorMessage: typeof message.errorMessage === "string" ? message.errorMessage : undefined,
-		};
-	}
-
-	if (terminal === undefined) return undefined;
-	if (terminal.stopReason === "error" || terminal.stopReason === "aborted") {
-		// What the turn produced outranks why it ended: an interrupted turn often holds a
-		// complete answer, and the provider's own error line would throw it away.
-		return {
-			status: "failed",
-			outcome: terminal.stopReason === "aborted" ? "aborted" : "error",
-			text: terminal.text.trim() || terminal.errorMessage?.trim() || `Subagent ${terminal.stopReason} before producing a result.`,
-		};
-	}
-	return {
-		status: "completed",
-		outcome: terminal.stopReason === "length" ? "truncated" : "done",
-		text: terminal.text.trim() || "(no output)",
-	};
-}
-
-/** What a running child is doing, read from the session file it writes as it goes. */
-type ChildProgress = {
-	/** Named tool calls so far — the cheapest honest measure of work actually done. */
-	toolUses: number;
-	/** The last thing it was seen doing. */
-	activity: string;
-	/** When the file last changed: when the child last put anything on paper. */
-	lastWriteAt: number | undefined;
-};
-
-/**
- * How far along a child is, for a parent that has to judge whether waiting is still the
- * right move.
- *
- * A state alone cannot answer that: `working` reads the same whether the child is
- * mid-tool or wedged, so a rule like "do not wait again if nothing changed" has nothing
- * to test against. The facts come from the file the child writes as it goes.
- */
-function readChildProgress(sessionId: string): ChildProgress | undefined {
-	const filePath = sessionFileFor(sessionId);
-	if (filePath === undefined) return undefined;
-	let text: string;
-	try {
-		text = readFileSync(filePath, "utf-8");
-	} catch {
-		return undefined;
-	}
-	let toolUses = 0;
-	let activity = "no tool call yet";
-	for (const line of text.split("\n")) {
-		if (line.trim().length === 0) continue;
-		let entry: { type?: string; message?: { role?: string; content?: unknown } };
-		try {
-			entry = JSON.parse(line) as typeof entry;
-		} catch {
-			continue;
-		}
-		if (entry.type !== "message" || entry.message === undefined) continue;
-		const content = Array.isArray(entry.message.content) ? entry.message.content : [];
-		for (const part of content) {
-			const piece = part as { type?: string; name?: string };
-			if (piece.type !== "toolCall") continue;
-			toolUses += 1;
-			activity = typeof piece.name === "string" ? `calling ${piece.name}` : "calling a tool";
-		}
-		if (entry.message.role === "assistant" && content.some((part) => (part as { type?: string }).type === "text")) {
-			activity = "writing";
-		}
-	}
-	let lastWriteAt: number | undefined;
-	try {
-		lastWriteAt = statSync(filePath).mtimeMs;
-	} catch {
-		lastWriteAt = undefined;
-	}
-	return { toolUses, activity, lastWriteAt };
 }
 
 /** What has changed since the parent's last read, in words a decision can be made from. */
@@ -1044,40 +698,6 @@ async function launchChild(
 	return launch;
 }
 
-/**
- * Whether the child's own transcript holds this task as a user message.
- *
- * A status describes the pane; this describes *this* text. Pi writes the user message
- * when it takes the task over, so the transcript is the one place where "my message
- * arrived" is a fact instead of an inference.
- */
-function taskInTranscript(sessionId: string, task: string): boolean {
-	const file = sessionFileFor(sessionId);
-	if (file === undefined) return false;
-	let text: string;
-	try {
-		text = readFileSync(file, "utf-8");
-	} catch {
-		return false;
-	}
-	// Enough of the task to be unmistakable, short enough to survive any wrapping.
-	const mark = task.slice(0, TASK_MARK_CHARS);
-	for (const line of text.split("\n")) {
-		if (!line.includes("\"user\"")) continue;
-		let record: { message?: { role?: string; content?: { type?: string; text?: string }[] } };
-		try {
-			record = JSON.parse(line) as typeof record;
-		} catch {
-			// The child is appending right now, so its last line can be half-written.
-			continue;
-		}
-		const message = record.message;
-		if (message?.role !== "user" || !Array.isArray(message.content)) continue;
-		const said = message.content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("");
-		if (said.includes(mark)) return true;
-	}
-	return false;
-}
 
 /** How a handover ended: the child wrote the task down, or it did not, or nothing was sent. */
 type Handover =
@@ -1159,7 +779,7 @@ async function taskSitsUnsent(pi: ExtensionAPI, sessionName: string, task: strin
 	rememberTerminal(sessionName, read?.terminalId);
 	if (read === undefined) return false;
 	// Enough of the task to be unmistakable; the pane wraps and indents long lines.
-	return read.text.includes(task.slice(0, 32));
+	return read.text.includes(task.slice(0, TASK_MARK_IN_PANE_CHARS));
 }
 
 /** The blocking path's tool result: the child's answer, capped, plus any notes. */

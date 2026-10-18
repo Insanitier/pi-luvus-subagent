@@ -6,8 +6,9 @@
  * backstops — a delegation removes its own prompt file and its own child's transcript.
  */
 import { spawnSync } from "node:child_process";
-import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { readSessionRecords } from "./child-session.ts";
 import { DELEGATION_ENTRY, MS_PER_DAY, PROMPT_DIR, PROMPT_RETENTION_DAYS, SESSION_DIR, isDirectory, sessionRoot } from "./env.ts";
 /**
  * Drop prompt files past their window.
@@ -90,20 +91,16 @@ function referencedSessionNames(): Set<string> | undefined {
 			}
 			if (!entry.endsWith(".jsonl")) continue;
 			files++;
-			let text: string;
-			try {
-				text = readFileSync(path, "utf-8");
-			} catch {
-				return undefined;
-			}
-			for (const line of text.split("\n")) {
-				if (!line.includes(DELEGATION_ENTRY)) continue;
-				let record: { customType?: string; data?: { sessionName?: string } };
-				try {
-					record = JSON.parse(line) as typeof record;
-				} catch {
-					return undefined;
-				}
+			// Only lines carrying the marker are decoded: a session that never delegated is
+			// never parsed. A line that will not parse is a give-up rather than a skip here —
+			// it might be the one naming a child, and a name missed deletes a transcript for
+			// nothing.
+			const records = readSessionRecords(path, {
+				lineFilter: (line) => line.includes(DELEGATION_ENTRY),
+				onUnparseable: "give-up",
+			});
+			if (records === undefined) return undefined;
+			for (const record of records as { customType?: string; data?: { sessionName?: string } }[]) {
 				if (record.customType === DELEGATION_ENTRY && typeof record.data?.sessionName === "string") {
 					names.add(record.data.sessionName);
 				}
