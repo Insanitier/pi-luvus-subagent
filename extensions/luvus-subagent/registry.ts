@@ -112,7 +112,9 @@ export function sinceLastRead(progress: ChildProgress, entry: Delegation): strin
 
 /** The line a running delegation adds: what it is doing, and what moved since last read. */
 export function progressLine(progress: ChildProgress | undefined, since: string | undefined): string {
-	if (progress === undefined) return "  progress: it has written no session file yet";
+	// Not "no session file yet": a child writing right now has a half-written last line, and
+	// the parse fails on it, so this line cannot tell the two apart and must not pretend to.
+	if (progress === undefined) return "  progress: no readable transcript yet";
 	const parts = [progress.activity, `${progress.toolUses} tool call${progress.toolUses === 1 ? "" : "s"}`];
 	// Only the first read carries the wall-clock age: afterwards the tail already says what
 	// the file has done since, and two ages in one line read as two different things.

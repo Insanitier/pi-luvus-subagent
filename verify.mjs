@@ -968,6 +968,7 @@ check(
 process.env.LUVUS_STUB_GONE = "";
 // A turn that ended on an upstream error leaves a live session behind: the parent has
 // to be told it can steer instead of delegating again.
+const erroredLogStart = readFileSync(STUB_LOG, "utf-8").length;
 const errored = await tools.delegate.execute("verify-errored", { agent: "fixture-bare", task: "ERRORED_TASK" }, undefined, undefined, ctx);
 check(
 	"a failed turn is its own state, with the provider's own words",
@@ -975,6 +976,16 @@ check(
 		errored.content[0].text.includes("upstream: connection reset") &&
 		errored.content[0].text.includes("the task did not finish"),
 	errored.content[0].text,
+);
+// That note used to end "(its pane is still there)", which the teardown contradicted in the same
+// breath: a terminal outcome closes the pane, and a parent told otherwise would steer a pane that
+// is already gone. Measured on a real interrupt, the note arrived and the pane was gone a second
+// later.
+check(
+	"a finished delegation does not claim a pane it just closed",
+	!errored.content[0].text.includes("pane is still there") &&
+		readFileSync(STUB_LOG, "utf-8").slice(erroredLogStart).includes("pane close"),
+	errored.content[0].text + " || " + readFileSync(STUB_LOG, "utf-8").slice(erroredLogStart).replace(/\n/g, " | "),
 );
 
 // The window is what makes "done" mean the child stopped. Two cases carry the whole reason it
@@ -1044,6 +1055,29 @@ check(
 	// taken at face value would have written before the retry and the continuation arrived.
 	windowed.every((one) => new RegExp(`${one.name}\\s+done`).test(windowRows)),
 	windowRows,
+);
+// A retry caught mid-record. A reader that parsed the file would fail here — the child's last
+// line is half-written — and lose the signal at the one moment it exists for, so the signal is
+// the file's mtime. This writes a record in two halves and completes it a second later.
+await deliverQueued();
+notices.length = 0;
+const partialStarted = await tools.delegate.execute("verify-partial", { agent: "fixture-bare", task: "ERRORED_TASK", wait: false }, undefined, undefined, ctx);
+const partialChild = nameIn(partialStarted);
+setTimeout(
+	() => appendFileSync(childSession(partialChild), '\n{"type":"message","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"STUB_ANSWER_COMPLETED'),
+	900,
+);
+setTimeout(() => appendFileSync(childSession(partialChild), 'LATER"}]}}'), 2200);
+
+await new Promise((resolve) => setTimeout(resolve, 8000));
+check(
+	"a retry caught mid-record is still noticed",
+	// The answer can only be read once the half line has been completed, and the delegation can
+	// only end `done`: a reader that gave up on the half line would have handed over the error
+	// turn that came before it.
+	notices.some((notice) => noticeText(notice).includes("STUB_ANSWER_COMPLETEDLATER")) &&
+		notices.every((notice) => !noticeText(notice).includes("(error")),
+	notices.map((notice) => noticeText(notice)).join(" || "),
 );
 process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS = "0";
 

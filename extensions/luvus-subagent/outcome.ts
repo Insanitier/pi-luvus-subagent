@@ -26,17 +26,17 @@ export function outcomeLine(outcome: ChildOutcome): { word: string; note: string
 		case "aborted":
 			return {
 				word: "aborted",
-				note: "(aborted before it finished — the answer may be incomplete; its pane is still there)",
+				note: "(aborted before it finished — the answer may be incomplete)",
 			};
 		case "error":
 			return {
 				word: "error",
-				note: "(its last turn ended as error — the task did not finish; its pane is still there)",
+				note: "(its last turn ended as error — the task did not finish)",
 			};
 		case "no-answer":
 			return {
 				word: "no answer",
-				note: "(it settled without writing an answer — there is no result to read; its pane is still there)",
+				note: "(it settled without writing an answer — there is no result to read)",
 			};
 		case "pane closed":
 			return { word: "pane closed", note: "(its pane was closed before it finished)" };

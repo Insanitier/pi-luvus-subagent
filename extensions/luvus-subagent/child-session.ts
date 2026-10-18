@@ -161,6 +161,22 @@ export type ChildProgress = {
 };
 
 /**
+ * When the child last wrote, without reading what it wrote.
+ *
+ * `readChildProgress` parses the file, and a child that is writing right now has a half-written
+ * last line — which makes the parse fail exactly when the fact matters most, at the moment a
+ * retry starts writing. This is a stat, so it cannot fail that way.
+ */
+export function childLastWriteAt(sessionId: string): number | undefined {
+	const filePath = sessionFileFor(sessionId);
+	if (filePath === undefined) return undefined;
+	try {
+		return statSync(filePath).mtimeMs;
+	} catch {
+		return undefined;
+	}
+}
+/**
  * How far along a child is, for a parent that has to judge whether waiting is still the
  * right move.
  *

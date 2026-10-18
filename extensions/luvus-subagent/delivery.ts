@@ -21,7 +21,7 @@
 import { rmSync } from "node:fs";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
-import { readChildProgress, readChildResult, type ChildResult } from "./child-session.ts";
+import { childLastWriteAt, readChildResult, type ChildResult } from "./child-session.ts";
 import { START_POLL_MS, WAIT_FLOOR_MS, closePane, paneIsGone, paneState, waitForSettle, type SettleOutcome } from "./luvus.ts";
 import { COLLAPSED_LINES, COMPLETION_OUTPUT_CAP, capCompletion, endedOf, outcomeLine, settledState, shownResult } from "./outcome.ts";
 import { alreadyReported, delegations, markReported, settleDelegation } from "./registry.ts";
@@ -142,7 +142,9 @@ function quiescenceMs(): number {
  *
  * Two signals, because neither is enough alone: the child's transcript, because a retry writes
  * and a child that has only lost its connection has written nothing; and the pane's own state,
- * because a continuation may start before it has anything to say. `continued` means the child
+ * because a continuation may start before it has anything to say. The transcript is read as its
+ * mtime and never as its content: a child writing right now has a half-written last line, and a
+ * parse that fails there would lose the signal at the one moment it exists for. `continued` means the child
  * is working again and the wait resumes; `quiet` means the state held, which is what makes it
  * final; `gone` is a pane that went away underneath it; `stale` is this session being torn
  * down, which has no next turn to deliver to.
@@ -155,14 +157,14 @@ export async function awaitQuiescence(
 ): Promise<"continued" | "quiet" | "gone" | "stale"> {
 	const window = quiescenceMs();
 	if (window === 0) return "quiet";
-	const baseline = readChildProgress(sessionName)?.lastWriteAt ?? Date.now();
+	const baseline = childLastWriteAt(sessionName) ?? Date.now();
 	const deadline = Date.now() + window;
 	for (;;) {
 		if (isStale()) return "stale";
 		if (Date.now() >= deadline) return "quiet";
 		await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
-		const progress = readChildProgress(sessionName);
-		if (progress?.lastWriteAt !== undefined && progress.lastWriteAt > baseline) return "continued";
+		const lastWriteAt = childLastWriteAt(sessionName);
+		if (lastWriteAt !== undefined && lastWriteAt > baseline) return "continued";
 		if ((await paneState(pi, pane)) === "working") return "continued";
 		if (await paneIsGone(pi, pane)) return "gone";
 	}
