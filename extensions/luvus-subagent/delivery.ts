@@ -19,7 +19,7 @@ import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-a
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { readChildResult } from "./child-session.ts";
 import { WAIT_FLOOR_MS, closePane, waitForSettle, type SettleOutcome } from "./luvus.ts";
-import { COLLAPSED_LINES, COMPLETION_OUTPUT_CAP, capCompletion, endedOf, outcomeLine, settledState, shownResult, waitExpiredNote } from "./outcome.ts";
+import { COLLAPSED_LINES, COMPLETION_OUTPUT_CAP, capCompletion, endedOf, outcomeLine, settledState, shownResult } from "./outcome.ts";
 import { alreadyReported, delegations, markReported, settleDelegation } from "./registry.ts";
 /**
  * Completion notices, delivered as one message.

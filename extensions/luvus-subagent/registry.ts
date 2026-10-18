@@ -13,9 +13,9 @@
  * flag it turns on (`reportedAt`) is only ever set through it.
  */
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import type { ChildProgress, ChildResult } from "./child-session.ts";
+import type { ChildProgress } from "./child-session.ts";
 import { DELEGATION_ENTRY, SETTLED_ENTRY } from "./env.ts";
-import { paneIsGone, type SettleOutcome } from "./luvus.ts";
+import { paneIsGone } from "./luvus.ts";
 // ── Where a child is shown, and what the parent sees while it runs ─────────
 
 /** Key the status line and the widget are published under. */
@@ -327,7 +327,6 @@ export async function replayDelegations(pi: ExtensionAPI, entries: readonly Repl
 	renderStatus();
 	return resumed;
 }
-
 
 // ── The writes the entry used to do by hand ───────────────────────────────
 /**

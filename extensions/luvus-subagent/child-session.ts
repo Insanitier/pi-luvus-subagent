@@ -200,19 +200,25 @@ export function readChildProgress(sessionId: string): ChildProgress | undefined 
 /**
  * Whether the child's own transcript holds this task as a user message.
  *
- * A status describes the pane; this describes *this* text. Pi writes the user message
- * when it takes the task over, so the transcript is the one place where "my message
- * arrived" is a fact instead of an inference.
+ * A status describes the pane; this describes *this* text. Pi writes the user message when it
+ * takes the task over, so the transcript is the one place where "my message arrived" is a fact
+ * instead of an inference.
+ *
+ * `fromRecord` is where the transcript stood before the text was pasted, and it is the whole
+ * reason this is not a plain search: a resumed session already holds user messages, and a
+ * parent retrying a task with the same words would otherwise be told the child took it while
+ * the text was still sitting in its editor.
  */
-export function taskInTranscript(sessionId: string, task: string): boolean {
+export function taskInTranscript(sessionId: string, task: string, fromRecord = 0): boolean {
 	const file = sessionFileFor(sessionId);
 	if (file === undefined) return false;
-	// The task text is what identifies it; the record filter is a cost decision, because a
-	// session holds every message the child ever sent and only user records can carry this.
+	// Whole records, not a filtered scan: the index this is asked about counts every record
+	// the file holds, so filtering first would move the boundary it is measured against.
 	const mark = task.slice(0, TASK_MARK_CHARS);
-	const records = readSessionRecords(file, { lineFilter: (line) => line.includes("\"user\"") });
+	const records = readSessionRecords(file);
 	if (records === undefined) return false;
-	for (const record of records as { message?: { role?: string; content?: { type?: string; text?: string }[] } }[]) {
+	const said = records.slice(fromRecord) as { message?: { role?: string; content?: { type?: string; text?: string }[] } }[];
+	for (const record of said) {
 		const message = record.message;
 		if (message?.role !== "user" || !Array.isArray(message.content)) continue;
 		const said = message.content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("");

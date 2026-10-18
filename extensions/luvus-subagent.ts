@@ -11,279 +11,27 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { rmSync } from "node:fs";
-import { join, resolve } from "node:path";
-import {
-	CONFIG_DIR_NAME,
-	type AgentToolResult,
-	CustomEditor,
-	type ExtensionAPI,
-	type ExtensionUIContext,
-	getAgentDir,
-	getMarkdownTheme,
-	parseFrontmatter,
-} from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text } from "@earendil-works/pi-tui";
+
+import { join } from "node:path";
+import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { installStateReporter } from "./luvus-subagent/state-reporter.ts";
-import {
-	answerAlreadyDelivered,
-	clearQueuedNotice,
-	deliverWhenSettled,
-	holdDeliveryFor,
-	queuedNotice,
-	recordDelivery,
-	registerCompletionRenderer,
-	releaseDeliveryHold,
-	teardownDelegation,
-} from "./luvus-subagent/delivery.ts";
-import {
-	COLLAPSED_LINES,
-	COMPLETION_OUTPUT_CAP,
-	capCompletion,
-	endedOf,
-	outcomeLine,
-	settledState,
-	shownResult,
-	waitExpiredNote,
-} from "./luvus-subagent/outcome.ts";
-import {
-	type Delegation,
-	type DelegationEntry,
-	type ReplayEntry,
-	LINGER_TURNS,
-	STATUS_KEY,
-	attachEntryApi,
-	beginSession,
-	countTurn,
-	delegations,
-	endSession,
-	entryApi,
-	formatElapsed,
-	progressLine,
-	rememberTerminal,
-	renderStatus,
-	replayDelegations,
-	restartTurnCount,
-	settleDelegation,
-	settleWaiters,
-	sinceLastRead,
-	stopStatusTicker,
-	trackDelegation,
-	waitForDelegation,
-} from "./luvus-subagent/registry.ts";
-import {
-	type AgentConfig,
-	type LaunchPlan,
-	discoverAgents,
-	formatArgv,
-	prepareLaunch,
-	promptFileFor,
-	writePromptFile,
-} from "./luvus-subagent/agents.ts";
-import {
-	type ChildOutcome,
-	type ChildProgress,
-	type ChildResult,
-	readChildProgress,
-	readChildResult,
-	sessionFileFor,
-	taskInTranscript,
-	TASK_MARK_IN_PANE_CHARS,
-} from "./luvus-subagent/child-session.ts";
-import {
-	type Launch,
-	type SettleOutcome,
-	PROMPT_SUBMIT_TIMEOUT_MS,
-	START_CONFIRM_SECONDS,
-	START_POLL_MS,
-	STEER_CONFIRM_SECONDS,
-	WAIT_FLOOR_MS,
-	WAIT_SECONDS,
-	callLuvus,
-	closePane,
-	LuvusError,
-	luvusBinary,
-	paneIsGone,
-	pressKey,
-	readPane,
-	startChild,
-	stateAuthority,
-	waitForSettle,
-} from "./luvus-subagent/luvus.ts";
+import { answerAlreadyDelivered, clearQueuedNotice, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation } from "./luvus-subagent/delivery.ts";
+import { capCompletion, settledState, waitExpiredNote } from "./luvus-subagent/outcome.ts";
+import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberTerminal, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./luvus-subagent/registry.ts";
+import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./luvus-subagent/agents.ts";
+import { type ChildResult, readChildProgress, readChildResult, sessionFileFor } from "./luvus-subagent/child-session.ts";
+import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, luvusBinary, paneIsGone, pressKey, readPane, stateAuthority, waitForSettle } from "./luvus-subagent/luvus.ts";
+import { blockingResult, dryRunReport, launchChild } from "./luvus-subagent/flow.ts";
+import { handoverText, submitAndConfirm } from "./luvus-subagent/handover.ts";
 import { installRawPaste } from "./luvus-subagent/editor.ts";
-import { DELEGATION_ENTRY, SETTLED_ENTRY, SUBAGENT_CHILD_FLAG } from "./luvus-subagent/env.ts";
+import { DELEGATION_ENTRY, SUBAGENT_CHILD_FLAG } from "./luvus-subagent/env.ts";
 import { sweepExpiredPrompts, sweepOrphanSessions } from "./luvus-subagent/sweeps.ts";
 // The pieces the checks drive by name. They live in modules now; the entry keeps the
 // names stable, because a check that reaches into a moved file is a check that has to
 // change whenever the file moves.
 export { discoverAgents, prepareLaunch, writePromptFile } from "./luvus-subagent/agents.ts";
-
-
-
-
-
-/**
- * Watch a background child to completion and hand its result to the parent.
- *
- * Detached on purpose: the delegation has already returned, so nothing awaits
- * this promise. Messaging the session is what tells the parent the child is
- * done, so this is the only delivery path a background delegation has.
- */
-// ── Delegation flow ────────────────────────────────────────────────────────
-
-/** The dry-run answer: the resolved plan, with nothing started. */
-function dryRunReport(
-	agent: AgentConfig,
-	args: string[],
-	task: string,
-	wait: boolean,
-	sessionName: string,
-	unresolvedSkills: string[],
-): string {
-	return [
-		`agent:   ${agent.name} [${agent.source}]`,
-		`file:    ${agent.filePath}`,
-		`argv:    pi ${formatArgv(args)}`,
-		`task:    ${task}`,
-		`wait:    ${wait}`,
-		`session: ${sessionName}`,
-		unresolvedSkills.length > 0 ? `unresolved: ${unresolvedSkills.join(", ")}` : "",
-	]
-		.filter(Boolean)
-		.join("\n");
-}
-
-/** Open the child's pane, then register it so its duration covers the whole delegation. */
-async function launchChild(
-	pi: ExtensionAPI,
-	sessionName: string,
-	plan: LaunchPlan,
-	ui: ExtensionUIContext | undefined,
-): Promise<Launch> {
-	const launch = await startChild(pi, sessionName, plan.args);
-	// Tracked from the launch, so the duration covers the whole delegation.
-	// No UI in print or JSON mode; the widget is simply not drawn there.
-	trackDelegation(sessionName, launch.pane, ui);
-	return launch;
-}
-
-
-/** How a handover ended: the child wrote the task down, or it did not, or nothing was sent. */
-type Handover =
-	| { state: "taken" }
-	| { state: "unsent"; code: string | undefined }
-	| { state: "queued"; presses: number; unsentInComposer: boolean };
-
-/**
- * Hand a task to a child and let its own transcript say whether it took it.
- *
- * Two steps, because one is not enough: `agent prompt` pastes the text, and a long
- * multi-line paste is *not* submitted by it — measured against the real CLI, where a
- * 12-line paste sat in the child's editor until a separate `agent keys <target> enter`.
- *
- * The evidence is the child's transcript, not its status. Luvus answers `agent start`
- * with the state it saw once the pane was ready, and its guidance is to accept that
- * "without another status lookup": a second lookup lands while the pane is still coming
- * up, where the answer is a guess read off the screen (`authority: command_fallback`) or
- * not reported yet, and neither says anything about *this* message. So the launch reply
- * is the baseline, and the confirmation is the user line the child writes when it picks
- * the task up.
- *
- * A handover the host refused sent nothing at all, and is its own answer. A launch reply
- * that reported the child as working is *not* one: measured live, `agent start` answered
- * `status: "working"` for a child that was still drawing its banner and had not taken a
- * single key — the pane's state says nothing about whether this text arrived, which is
- * what Luvus' own guidance means by a status "does not by itself prove prompt readiness".
- * So the status is reported, never used to decide: the transcript decides.
- */
-async function submitAndConfirm(
-	pi: ExtensionAPI,
-	sessionName: string,
-	task: string,
-	seconds: number,
-	fence?: string,
-): Promise<Handover> {
-	// Paste, then submit: a long paste leaves the text sitting in the editor on its own.
-	try {
-		const prompt = ["agent", "prompt", sessionName, task];
-		// The host's own fence: it refuses the prompt unless the terminal behind the name is the
-		// one this id names (`content_revision_conflict`, measured). Only callers that have read
-		// the pane recently can pass one; at launch there is nothing to compare against yet.
-		if (fence !== undefined) prompt.push("--terminal-id", fence);
-		await callLuvus(pi, prompt, PROMPT_SUBMIT_TIMEOUT_MS);
-		await pressKey(pi, sessionName, "enter");
-	} catch (error) {
-		// A pane that went away mid-hand-over refuses the paste; the caller asks whether it
-		// is gone and reports that instead of a task that was never sent. The code rides along
-		// because "the pane is gone" and "the pane declined it" are different answers.
-		return { state: "unsent", code: error instanceof LuvusError ? error.code : undefined };
-	}
-	const deadline = Date.now() + seconds * 1000;
-	let presses = 1;
-	while (Date.now() < deadline) {
-		if (taskInTranscript(sessionName, task)) return { state: "taken" };
-		// Still missing, so the paste is sitting there unsent and Enter is the step that did
-		// not land — a child that was still starting swallows one, and pressing again costs
-		// nothing while submitting is the only thing left to do.
-		await new Promise((resolve) => setTimeout(resolve, START_POLL_MS * 3));
-		if (Date.now() >= deadline) break;
-		await pressKey(pi, sessionName, "enter").catch(() => undefined);
-		presses += 1;
-	}
-	return { state: "queued", presses, unsentInComposer: await taskSitsUnsent(pi, sessionName, task) };
-}
-
-/**
- * Whether the task text is still sitting in the child's input box.
- *
- * The one failure worth naming exactly: the paste landed and the Enters did not, so the
- * task is neither lost nor running — it is waiting for the key that submits it. Without
- * this, that case is indistinguishable from a child that read the task and ignored it,
- * and the two call for opposite next moves.
- */
-async function taskSitsUnsent(pi: ExtensionAPI, sessionName: string, task: string): Promise<boolean> {
-	const read = await readPane(pi, sessionName);
-	// A read taken here is also where a delegation first learns which terminal it is running
-	// in, so a steer much later can refuse a pane id that has changed hands since.
-	rememberTerminal(sessionName, read?.terminalId);
-	if (read === undefined) return false;
-	// Enough of the task to be unmistakable; the pane wraps and indents long lines.
-	return read.text.includes(task.slice(0, TASK_MARK_IN_PANE_CHARS));
-}
-
-/** The blocking path's tool result: the child's answer, capped, plus any notes. */
-function blockingResult(
-	agentName: string,
-	outcome: SettleOutcome | undefined,
-	result: ChildResult | undefined,
-	notes: string[],
-): AgentToolResult<unknown> {
-	// One dimension, like the reference: how the delegation ended. The wait decides when
-	// the child produced no result at all, the child's own last turn decides otherwise,
-	// and a turn that landed no answer is its own state rather than `done`.
-	const ended = endedOf(outcome, result);
-	const line = outcomeLine(ended);
-	const shown = shownResult(result, ended);
-	const body = [...notes];
-	if (line.note.length > 0) body.push(line.note);
-	return {
-		content: [
-			{
-				type: "text",
-				text: [
-					`${agentName} (${line.word}):`,
-					...(shown.length > 0 ? ["", shown] : []),
-					...(body.length > 0 ? ["", ...body] : []),
-				].join("\n"),
-			},
-		],
-		// The same single rule the widget and the notice read, not a second reading of it.
-		isError: settledState(outcome, result) === "failed",
-		details: {},
-	};
-}
-
 
 // ── Extension entry ────────────────────────────────────────────────────────
 
@@ -708,19 +456,11 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					STEER_CONFIRM_SECONDS,
 					seen?.terminalId,
 				);
-				// Four facts, and only four: the child wrote the message down, the host refused it and
-				// said why, it is sitting in the input box unsent, or it was accepted and not written
-				// down yet.
-				const text =
-					verdict.state === "taken"
-						? `${how} ${params.sessionName}, and it is working.`
-						: verdict.state === "unsent"
-							? `${how} ${params.sessionName} — nothing was sent: the host refused the message${
-									verdict.code === undefined ? "" : ` (${verdict.code})`
-								}.`
-							: verdict.unsentInComposer
-								? `${how} ${params.sessionName} — the message is sitting in its input box unsent, so steer it again to press Enter.`
-								: `${how} ${params.sessionName} — queued; the host took the message, but pickup is not confirmed.`;
+				// Four facts, and only four: the child wrote the message down, the host refused
+				// it and said why, it is sitting in the input box unsent, or it was accepted and
+				// not written down yet. One function says all four, so the delegate path and this
+				// one cannot drift into two accounts of the same handover.
+				const text = handoverText(verdict, params.sessionName, how);
 				return { content: [{ type: "text", text }], details: {} };
 			} catch (error) {
 				return {

@@ -526,6 +526,30 @@ check(
 	resumeLogAfter.trim().split("\n").slice(0, 4).join(" | "),
 );
 
+// The same file, and this time the task text is *already* in it: a parent that retries the
+// same words would otherwise be told the child took the task, while the text was still
+// sitting in its editor. The stub is told not to pick this one up, so the only evidence
+// either way is the difference the handover itself makes.
+const retryId = "retry-fixture";
+writeFileSync(
+	join(resumeDir, `1970-01-01T00-00-00-000Z_${retryId}.jsonl`),
+	JSON.stringify({
+		type: "message",
+		message: { role: "user", content: [{ type: "text", text: "NEVER_PICKED" }] },
+	}),
+);
+const retry = await tools.delegate.execute(
+	"verify-retry-same-task",
+	{ agent: "fixture-bare", task: "NEVER_PICKED", resume: retryId, wait: false },
+	undefined,
+	undefined,
+	ctx,
+);
+check(
+	"a task already in a resumed transcript is not reported as taken",
+	!retry.content[0].text.includes("and it is working") && retry.content[0].text.includes("input box"),
+	retry.content[0].text,
+);
 // The submit loop is START_CONFIRM_SECONDS by design, so this one check is the slow part
 // of the suite (~15s). The watchers of earlier background delegations settle instantly in
 // this stub and close their panes, and every stub pane is 42, so they are held off while
