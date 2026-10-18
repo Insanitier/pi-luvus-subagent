@@ -49,8 +49,15 @@ Retrying a failed turn is deliberately not this extension's job. A retry engine 
 
 Child sessions live in `~/.pi/agent/subagent-sessions`, and one is kept while some surviving session file still names it — a name is the only way back in, since `resume` reopens by it and `subagent_status` answers by it, so a transcript nothing names is what a deleted conversation left behind. Pi deletes a conversation by moving its file out of `sessions/` and emits no event for it, so the sweep looks instead of listening: it rides on a delegation launch, rescans at most once an hour, and reaps nothing it could not read in full. A child is launched with `--subagent-child`, which loads this extension for state reporting only — handing the child the tools too would let subagents spawn subagents without bound.
 
+## Where the code lives
+`extensions/luvus-subagent.ts` is the entry: it wires Pi's events and the three tools, and nothing else. Everything a reader needs to change in isolation sits beside it in `extensions/luvus-subagent/`, and the imports say which direction each piece may depend in: `env` holds the constants and where files live; `agents`, `sweeps` and `editor` are the stateless pieces; `luvus` is the only place that calls the host CLI; `child-session` is the authoritative read of a child's own session file; `registry` is the delegation table and the one row the parent sees; `outcome` says what an end means; `handover` delivers a task and reads back whether it landed; `delivery` hands an answer over exactly once; `flow` is the launch plan and the blocking answer. Nothing here is a layer for its own sake: each file is the one place a given rule can be read, which is what makes a change to that rule local.
+The entry keeps the names the checks drive by name (`discoverAgents`, `prepareLaunch`, `writePromptFile`, and the default export), so a check never has to know which file a piece moved to.
+
 ## Verify
 
 ```bash
-npm test   # node verify.mjs — the whole extension against a stub CLI, no network
+npm test         # node verify.mjs — the whole extension against a stub CLI, no network
+npm install      # once: the check needs the Pi SDK types and TypeScript
+npm run check    # tsc --noEmit, strict, no unused locals or parameters
 ```
+`npm run check` is not decoration. The split into modules is only real if a missing import is a compile error rather than a runtime one, and it has already caught exactly that — a constant the settle watcher needed and a probe used when a delegation is replayed, neither of which the end-to-end checks reached.
