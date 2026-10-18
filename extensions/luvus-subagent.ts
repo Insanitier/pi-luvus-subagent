@@ -572,6 +572,24 @@ type LuvusReply = {
 };
 
 /**
+ * A refusal from the host, carrying the code it used.
+ *
+ * The code is the part worth keeping: `agent_not_running` means the pane is gone, while a
+ * refusal with no code is a pane that is there and declined what was sent. A caller that
+ * folds the two into one message sends a parent looking for a terminal that no longer
+ * exists.
+ */
+class LuvusError extends Error {
+	readonly code: string | undefined;
+
+	constructor(message: string, code: string | undefined) {
+		super(message);
+		this.name = "LuvusError";
+		this.code = code;
+	}
+}
+
+/**
  * One Luvus CLI call.
  *
  * Luvus answers every command with `{id, result}` or `{id, error}`. A structured
@@ -596,7 +614,10 @@ async function callLuvus(pi: ExtensionAPI, args: string[], timeoutMs: number): P
 		throw new Error(`${label}: unreadable reply${tail.length > 0 ? ` (${tail})` : ""}`);
 	}
 	if (envelope.error !== undefined) {
-		throw new Error(`${label}: ${envelope.error.message ?? envelope.error.code ?? "failed"}`);
+		throw new LuvusError(
+			`${label}: ${envelope.error.message ?? envelope.error.code ?? "failed"}`,
+			typeof envelope.error.code === "string" ? envelope.error.code : undefined,
+		);
 	}
 	return { result: envelope.result ?? {}, code: exec.code };
 }
@@ -660,10 +681,18 @@ async function paneIsGone(pi: ExtensionAPI, pane: string): Promise<boolean> {
  * How a child ended: settled, still running, or its pane gone.
  *
  * The window is the blocking delegation's own and is not the caller's to shorten: a
- * wait that returns before the child is done is what a poll loop is made of. Luvus
- * reports a closed pane and an expired wait with the same exit code and no JSON,
- * so a non-zero result asks the pane itself — a closed pane answers at once, and
- * reading that as "still running" is what leaves a parent counting for nothing.
+ * wait that returns before the child is done is what a poll loop is made of.
+ *
+ * Luvus reports both endings with exit code 2: a closed pane prints `pane not found` on
+ * stderr, an expired wait prints nothing at all (both measured). Reading that difference
+ * would mean matching human text — which is localized, and which `--json` does not turn
+ * into an error envelope here, `wait` rejecting the flag as a usage error. So a non-zero
+ * result asks the pane itself: a closed pane answers at once, and reading that as "still
+ * running" is what leaves a parent counting for nothing.
+ *
+ * A wait also has to be addressed by pane id: `wait agent-status <name>` is a usage error
+ * (measured). Pane ids are small integers the host reuses after a close, which is why
+ * identity is fenced where a message is actually sent — see `steerSubagent`.
  */
 async function waitForSettle(pi: ExtensionAPI, pane: string): Promise<SettleOutcome> {
 	const done = await callLuvus(
@@ -681,6 +710,51 @@ async function closePane(pi: ExtensionAPI, pane: string): Promise<void> {
 	} catch {
 		// A pane that outlives its delegation is clutter, not a failure.
 	}
+}
+
+/** A string field of a reply that arrived as unknown shape, or undefined. */
+function stringField(source: unknown, key: string): string | undefined {
+	if (typeof source !== "object" || source === null) return undefined;
+	const value = (source as Record<string, unknown>)[key];
+	return typeof value === "string" ? value : undefined;
+}
+
+/** One read of a pane: what it shows, and which terminal instance is showing it. */
+type PaneRead = { text: string; terminalId: string | undefined };
+
+/**
+ * Read a pane's text, and the identity of the terminal showing it.
+ *
+ * The terminal id is the only handle that survives a pane id being reused: `pane` is a
+ * small integer the host hands out again after a close, while `terminal_id` names the
+ * instance. It is read on the paths that come later rather than at launch — a pane this
+ * delegation started seconds ago cannot be somebody else's yet.
+ */
+async function readPane(pi: ExtensionAPI, target: string): Promise<PaneRead | undefined> {
+	const read = await callLuvus(pi, ["agent", "read", target], PANE_PROBE_TIMEOUT_MS).catch(() => undefined);
+	if (read === undefined) return undefined;
+	return { text: stringField(read.result, "text") ?? "", terminalId: stringField(read.result, "terminal_id") };
+}
+
+/**
+ * Who is claiming the pane's state, in the host's own words.
+ *
+ * `agent explain` is the evidence behind a status, which is what a parent needs when the
+ * status is surprising: `integration_report` is the child's own reporter speaking, while
+ * `command_fallback` or `screen_text` is Luvus guessing at what the pane draws. Measured
+ * live: a child still drawing its banner was reported `working` by a guess — and without
+ * this the failure message passes that guess on as a fact.
+ */
+async function stateAuthority(pi: ExtensionAPI, target: string): Promise<string | undefined> {
+	const explained = await callLuvus(pi, ["agent", "explain", target], PANE_PROBE_TIMEOUT_MS).catch(
+		() => undefined,
+	);
+	if (explained === undefined) return undefined;
+	const evidence = explained.result.state_evidence;
+	const source = stringField(evidence, "source") ?? stringField(explained.result.authority, "source");
+	if (source === undefined) return undefined;
+	const confidence = stringField(evidence, "confidence");
+	return confidence === undefined ? source : `${source} (${confidence})`;
 }
 
 
@@ -1155,6 +1229,13 @@ type Delegation = {
 	reportedAt?: number;
 	/** What the last read of this delegation saw, so the next one can say what changed. */
 	lastRead?: { at: number; toolUses: number };
+	/**
+	 * The terminal instance this delegation was last seen running in.
+	 *
+	 * The pane is a small integer the host hands out again after a close, the terminal id
+	 * is not — so this is what a later steer checks before it types into a stranger's pane.
+	 */
+	terminalId?: string;
 };
 
 /** How many parent turns the widget keeps a settled row, per the reference. */
@@ -1348,6 +1429,18 @@ function alreadyReported(sessionName: string): boolean {
 	return delegations.get(sessionName)?.reportedAt !== undefined;
 }
 
+/**
+ * Keep the terminal id a delegation is known by, so a later steer can tell it is still the
+ * same terminal. A delegation this session never started is not tracked, and not tracking
+ * it is not a failure: the read that learned the id simply had nothing to attach it to.
+ */
+function rememberTerminal(sessionName: string, terminalId: string | undefined): void {
+	if (terminalId === undefined) return;
+	const entry = delegations.get(sessionName);
+	if (entry === undefined || entry.terminalId === terminalId) return;
+	delegations.set(sessionName, { ...entry, terminalId });
+}
+
 /** The fields a replay reads; nothing else about an entry matters here. */
 type ReplayEntry = { type: string; customType?: string; data?: unknown };
 
@@ -1476,7 +1569,7 @@ function taskInTranscript(sessionId: string, task: string): boolean {
 /** How a handover ended: the child wrote the task down, or it did not, or nothing was sent. */
 type Handover =
 	| { state: "taken" }
-	| { state: "unsent" }
+	| { state: "unsent"; code: string | undefined }
 	| { state: "queued"; presses: number; unsentInComposer: boolean };
 
 /**
@@ -1506,15 +1599,22 @@ async function submitAndConfirm(
 	sessionName: string,
 	task: string,
 	seconds: number,
+	fence?: string,
 ): Promise<Handover> {
 	// Paste, then submit: a long paste leaves the text sitting in the editor on its own.
 	try {
-		await callLuvus(pi, ["agent", "prompt", sessionName, task], PROMPT_SUBMIT_TIMEOUT_MS);
+		const prompt = ["agent", "prompt", sessionName, task];
+		// The host's own fence: it refuses the prompt unless the terminal behind the name is the
+		// one this id names (`content_revision_conflict`, measured). Only callers that have read
+		// the pane recently can pass one; at launch there is nothing to compare against yet.
+		if (fence !== undefined) prompt.push("--terminal-id", fence);
+		await callLuvus(pi, prompt, PROMPT_SUBMIT_TIMEOUT_MS);
 		await pressKey(pi, sessionName, "enter");
-	} catch {
+	} catch (error) {
 		// A pane that went away mid-hand-over refuses the paste; the caller asks whether it
-		// is gone and reports that instead of a task that was never sent.
-		return { state: "unsent" };
+		// is gone and reports that instead of a task that was never sent. The code rides along
+		// because "the pane is gone" and "the pane declined it" are different answers.
+		return { state: "unsent", code: error instanceof LuvusError ? error.code : undefined };
 	}
 	const deadline = Date.now() + seconds * 1000;
 	let presses = 1;
@@ -1540,13 +1640,13 @@ async function submitAndConfirm(
  * and the two call for opposite next moves.
  */
 async function taskSitsUnsent(pi: ExtensionAPI, sessionName: string, task: string): Promise<boolean> {
-	const read = await callLuvus(pi, ["agent", "read", sessionName], PANE_PROBE_TIMEOUT_MS).catch(
-		() => undefined,
-	);
+	const read = await readPane(pi, sessionName);
+	// A read taken here is also where a delegation first learns which terminal it is running
+	// in, so a steer much later can refuse a pane id that has changed hands since.
+	rememberTerminal(sessionName, read?.terminalId);
 	if (read === undefined) return false;
-	const text = typeof read.result.text === "string" ? read.result.text : "";
 	// Enough of the task to be unmistakable; the pane wraps and indents long lines.
-	return text.includes(task.slice(0, 32));
+	return read.text.includes(task.slice(0, 32));
 }
 
 /** The blocking path's tool result: the child's answer, capped, plus any notes. */
@@ -1899,7 +1999,9 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `${sessionName} could not be handed the task: the host refused the paste (its pane is still there), so nothing was sent and nothing is running.`,
+								text: `${sessionName} could not be handed the task: the host refused the paste${
+									started.code === undefined ? "" : ` (${started.code})`
+								} (its pane is still there), so nothing was sent and nothing is running.`,
 							},
 						],
 						isError: true,
@@ -1929,12 +2031,20 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					});
 					const reported = launch.status === undefined ? "no status" : `"${launch.status}"`;
 					const presses = `${started.presses} Enter${started.presses === 1 ? "" : "s"}`;
+					// The state that came back with the launch is reported *with the authority behind it*:
+					// a guess read off a booting screen is not the child saying anything, and a parent that
+					// cannot tell the two apart reads the guess as work in progress.
+					const source = await stateAuthority(pi, sessionName);
+					const whence =
+						source === undefined
+							? `the host reported ${reported} when the pane came up`
+							: `the host reported ${reported} when the pane came up, and its state now comes from ${source}`;
 					// Two failures wear the same face and call for opposite moves, so they are named
 					// apart: a task sitting in the input box is not lost and not running — it is waiting
 					// for the key that submits it, and pressing it again is the whole fix.
 					const unpicked = started.unsentInComposer
-						? `${sessionName} still has the task sitting in its input box: the paste landed, and ${presses} over ${START_CONFIRM_SECONDS}s did not submit it (the host reported ${reported} when the pane came up). Nothing is running — steer it to press that key again, rather than sending the task a second time.`
-						: `${sessionName} did not confirm the task: it was pasted and submitted ${presses} over ${START_CONFIRM_SECONDS}s, its transcript still held no such message, and its input box is empty (the host reported ${reported} when the pane came up). It may still be picked up, so check it or steer it instead of sending the task again; its pane is left open.`;
+						? `${sessionName} still has the task sitting in its input box: the paste landed, and ${presses} over ${START_CONFIRM_SECONDS}s did not submit it (${whence}). Nothing is running — steer it to press that key again, rather than sending the task a second time.`
+						: `${sessionName} did not confirm the task: it was pasted and submitted ${presses} over ${START_CONFIRM_SECONDS}s, its transcript still held no such message, and its input box is empty (${whence}). It may still be picked up, so check it or steer it instead of sending the task again; its pane is left open.`;
 					return { content: [{ type: "text", text: unpicked }], isError: true };
 				}
 				if (wait) {
@@ -2022,20 +2132,48 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			try {
+				// Identity before delivery: the pane id is an integer the host hands out again after a
+				// close, so the terminal behind this name has to be the one this delegation was last
+				// seen in, or the message lands in a stranger's pane. A read that fails is not a
+				// verdict — a Luvus that cannot be reached has said nothing — so only a definite
+				// mismatch refuses here, and the same id rides along as the host's own fence.
+				const seen = await readPane(pi, params.sessionName);
+				const known = delegations.get(params.sessionName)?.terminalId;
+				if (seen?.terminalId !== undefined && known !== undefined && known !== seen.terminalId) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Not sent: the pane behind ${params.sessionName} is a different terminal now (it was ${known}, it is ${seen.terminalId}), so the message would have gone somewhere else. Its delegation is still in subagent_status.`,
+							},
+						],
+						isError: true,
+					};
+				}
+				rememberTerminal(params.sessionName, seen?.terminalId);
 				if (params.interrupt === true) {
 					await pressKey(pi, params.sessionName, "esc");
 				}
 				const how = params.interrupt === true ? "Interrupted, then" : "Sent to";
 				// A steer has no launch reply to read: the child is normally already working, which
 				// is exactly when a status proves nothing. Its transcript is the evidence instead.
-				const verdict = await submitAndConfirm(pi, params.sessionName, params.message, STEER_CONFIRM_SECONDS);
-				// Four facts, and only four: the child wrote the message down, the host refused it,
-				// it is sitting in the input box unsent, or it was accepted and not written down yet.
+				const verdict = await submitAndConfirm(
+					pi,
+					params.sessionName,
+					params.message,
+					STEER_CONFIRM_SECONDS,
+					seen?.terminalId,
+				);
+				// Four facts, and only four: the child wrote the message down, the host refused it and
+				// said why, it is sitting in the input box unsent, or it was accepted and not written
+				// down yet.
 				const text =
 					verdict.state === "taken"
 						? `${how} ${params.sessionName}, and it is working.`
 						: verdict.state === "unsent"
-							? `${how} ${params.sessionName} — nothing was sent: the host refused the message.`
+							? `${how} ${params.sessionName} — nothing was sent: the host refused the message${
+									verdict.code === undefined ? "" : ` (${verdict.code})`
+								}.`
 							: verdict.unsentInComposer
 								? `${how} ${params.sessionName} — the message is sitting in its input box unsent, so steer it again to press Enter.`
 								: `${how} ${params.sessionName} — queued; the host took the message, but pickup is not confirmed.`;

@@ -182,7 +182,25 @@ if (argv[0] === "agent" && argv[1] === "read") {
 	// when its Enters did not land, to tell a task waiting for a key from one never sent.
 	const pending = join(sessionDir, argv[2] + ".pending");
 	const task = existsSync(pending) ? readFileSync(pending, "utf-8") : "";
-	ok({ text: task === "" ? "no pending input" : "\u276f " + task });
+	// The terminal id is the pane's identity across a close, so it is read from a file a test
+	// can rewrite: that is how a pane which changed hands since is modelled.
+	const terminal = join(sessionDir, argv[2] + ".terminal");
+	const terminalId = existsSync(terminal)
+		? readFileSync(terminal, "utf-8")
+		: "deadbeefdeadbeefdeadbeefdeadbeef";
+	ok({ text: task === "" ? "no pending input" : "\u276f " + task, terminal_id: terminalId });
+}
+if (argv[0] === "agent" && argv[1] === "explain") {
+	// The evidence behind a status: a pane whose state nothing reported is a guess read off
+	// the screen, which is the difference a parent needs when the status is surprising.
+	const task = existsSync(join(sessionDir, argv[2] + ".pending"))
+		? readFileSync(join(sessionDir, argv[2] + ".pending"), "utf-8")
+		: "";
+	ok({
+		status: task === "NEVER_PICKED" ? "idle" : "working",
+		state_evidence: { source: task === "NEVER_PICKED" ? "command_fallback" : "integration_report" },
+		authority: { source: task === "NEVER_PICKED" ? "command_fallback" : "pi/extension" },
+	});
 }
 if (argv[0] === "wait") process.exit(process.env.LUVUS_STUB_GONE === "1" ? 2 : process.env.LUVUS_STUB_UNSETTLED === "1" ? 1 : 0);
 if (argv[0] === "agent" && argv[1] === "get") {
@@ -524,10 +542,13 @@ const unpicked = await tools.delegate.execute(
 	ctx,
 );
 check(
-	"a task the child never took is unconfirmed, and says what the host reported",
+	"a task the child never took is unconfirmed, and names the authority behind its state",
 	unpicked.isError === true &&
 		unpicked.content[0].text.includes("still has the task sitting in its input box") &&
 		unpicked.content[0].text.includes('"idle"') &&
+		// A guess read off the screen is not the child saying anything, and the message says
+		// which of the two it is instead of passing the guess on as a fact.
+		unpicked.content[0].text.includes("comes from command_fallback") &&
 		unpicked.content[0].text.includes("steer it to press that key again"),
 	unpicked.content[0].text,
 );
@@ -968,10 +989,13 @@ const steered = await tools.steer.execute(
 const steerLog = readFileSync(STUB_LOG, "utf-8").slice(logBefore).trim().split("\n");
 check("steer reports what it did", steered.content[0].text.includes("Interrupted, then"), steered.content[0].text);
 check(
-	"steer interrupts before it prompts",
-	steerLog[0] === "agent keys fixture-bare-deadbe esc" &&
-		steerLog[1] === "agent prompt fixture-bare-deadbe go left" &&
-		steerLog[2] === "agent keys fixture-bare-deadbe enter" &&
+	"steer checks identity, interrupts, then prompts, in that order",
+	steerLog[0] === "agent read fixture-bare-deadbe" &&
+		steerLog[1] === "agent keys fixture-bare-deadbe esc" &&
+		steerLog[2] === "agent prompt fixture-bare-deadbe go left --terminal-id deadbeefdeadbeefdeadbeefdeadbeef" &&
+		steerLog[3] === "agent keys fixture-bare-deadbe enter" &&
+		// The identity check is the read, not a separate lookup: a status lookup here is what
+		// the reference implementation warns against when a child is already working.
 		!steerLog.some((line) => line.startsWith("agent get ")),
 	steerLog.join(" | "),
 );
@@ -987,10 +1011,47 @@ const refusedSteer = await tools.steer.execute(
 );
 delete process.env.LUVUS_STUB_GONE;
 check(
-	"a steer the host refused says nothing was sent",
-	refusedSteer.content[0].text.includes("nothing was sent"),
+	"a steer the host refused says nothing was sent, and which refusal it was",
+	refusedSteer.content[0].text.includes("nothing was sent") &&
+		refusedSteer.content[0].text.includes("(not_found)"),
 	refusedSteer.content[0].text,
 );
+
+// The pane id is an integer the host hands out again after a close, so a steer checks the
+// terminal behind the name before typing into it: the same name on a different terminal is
+// somebody else's pane, and the message would have gone there. The host checks the same id
+// again with `--terminal-id`, but the check has to come first — pressing Esc into a stranger
+// is already a change to their terminal.
+const fencedMark = readFileSync(STUB_LOG, "utf-8").length;
+await tools.delegate.execute(
+	"verify-fenced",
+	{ agent: "fixture-bare", task: "FENCED_TASK" },
+	undefined,
+	undefined,
+	ctx,
+);
+const fencedName = /agent start (fixture-bare-[0-9a-f]{6})/
+	.exec(readFileSync(STUB_LOG, "utf-8").slice(fencedMark))?.[1];
+// The first steer is what records the terminal this delegation was seen in.
+await tools.steer.execute("verify-fenced-first", { sessionName: fencedName, message: "go left" }, undefined, undefined, ctx);
+writeFileSync(join(SESSION_DIR, `${fencedName}.terminal`), "feedfacefeedfacefeedfacefeedface");
+const reusedLog = readFileSync(STUB_LOG, "utf-8").length;
+const reused = await tools.steer.execute(
+	"verify-fenced-reused",
+	{ sessionName: fencedName, message: "go up", interrupt: true },
+	undefined,
+	undefined,
+	ctx,
+);
+check(
+	"a steer onto a pane that changed hands sends nothing, and says why",
+	reused.isError === true &&
+		reused.content[0].text.includes("different terminal now") &&
+		!readFileSync(STUB_LOG, "utf-8").slice(reusedLog).includes("agent prompt") &&
+		!readFileSync(STUB_LOG, "utf-8").slice(reusedLog).includes("agent keys"),
+	reused.content[0].text,
+);
+writeFileSync(join(SESSION_DIR, `${fencedName}.terminal`), "deadbeefdeadbeefdeadbeefdeadbeef");
 
 const left = readdirSync(PROMPT_DIR).filter((name) => !before.has(name));
 check("no prompt file is left by any path", left.length === 0, left.join(", "));
