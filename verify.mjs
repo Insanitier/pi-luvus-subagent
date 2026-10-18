@@ -1010,7 +1010,7 @@ const writeAnotherTurn = (name, answer) =>
 /** The session name the tool just reported, so the retry lands in that child's transcript. */
 const nameIn = (result) => /fixture-bare-[0-9a-f]{6}/.exec(result.content[0].text)?.[0];
 
-// A window a real child would have, shortened so the check need not wait half a minute.
+// A window a real child would have, shortened so the check need not wait ten seconds.
 process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS = "2500";
 const watched = [
 	{ log: "verify-retried", task: "ERRORED_TASK", answer: "STUB_ANSWER_AFTER_RETRY" },

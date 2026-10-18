@@ -123,10 +123,16 @@ export function registerCompletionRenderer(pi: ExtensionAPI): void {
  * it has held for this window with no new writing and no return to `working`. The cost is that
  * a delegation is reported this much later than the child finished; the gain is that "done"
  * means the child stopped, which is what every reader of a state here assumes it means.
+ *
+ * Ten seconds, chosen against a real retry extension rather than from theory: its retry followed
+ * the dropped connection within a couple of seconds, and the window has to outlast the gap a
+ * retry actually takes, not the worst one imaginable. It is also what a parent pays on every
+ * delegation, including the ones that simply finished — so it is the smallest window that
+ * comfortably covers that measured gap, and not a round half minute.
  */
-const QUIESCENCE_WINDOW_MS = 30_000;
+const QUIESCENCE_WINDOW_MS = 10_000;
 /**
- * The window above, overridable only so the checks need not wait half a minute per case.
+ * The window above, overridable only so the checks need not wait ten seconds per case.
  *
  * Zero is a legal value and means "take the state as reported": a suite that had to spend the
  * window on every delegation in it would be testing this window instead of what it asked about.
