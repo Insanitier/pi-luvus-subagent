@@ -36,7 +36,7 @@ function sessionRecordCount(sessionName: string): number {
  * multi-line paste is *not* submitted by it — measured against the real CLI, where a
  * 12-line paste sat in the child's editor until a separate `agent keys <target> enter`.
  *
- * The evidence is the child's transcript, not its status. Luvus answers `agent start`
+ * The evidence is the child's transcript, not its status. The pane's state says nothing
  * with the state it saw once the pane was ready, and its guidance is to accept that
  * "without another status lookup": a second lookup lands while the pane is still coming
  * up, where the answer is a guess read off the screen (`authority: command_fallback`) or
@@ -48,7 +48,7 @@ function sessionRecordCount(sessionName: string): number {
  * that reported the child as working is *not* one: measured live, `agent start` answered
  * `status: "working"` for a child that was still drawing its banner and had not taken a
  * single key — the pane's state says nothing about whether this text arrived, which is
- * what Luvus' own guidance means by a status "does not by itself prove prompt readiness".
+ * about whether this text arrived — a status describes the pane, not this message.
  * So the status is reported, never used to decide: the transcript decides.
  */
 export async function submitAndConfirm(

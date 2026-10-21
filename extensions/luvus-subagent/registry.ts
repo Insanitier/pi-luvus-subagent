@@ -72,7 +72,7 @@ export const delegations = new Map<string, Delegation>();
 /**
  * Reads blocked on a delegation, resolved by the settle that ends it.
  *
- * The wait is on the registry, not on a Luvus wait of its own: the watcher settles this
+ * The wait is on the registry, not on a wait of its own: the watcher settles this
  * exactly once, and the promise it resolves is the same event the notice is built from —
  * so a waiting read cannot miss the end by starting a moment too late.
  */

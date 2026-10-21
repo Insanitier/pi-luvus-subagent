@@ -1,11 +1,11 @@
 /**
- * luvus-subagent — Luvus-backed subagents for Pi.
+ * luvus-subagent — tty7-backed subagents for Pi.
  *
- * A subagent is a real `pi` process running in a Luvus pane, so it is visible,
+ * A subagent is a real `pi` process running in a tty7 pane, so it is visible,
  * interruptible, and steerable while it works. Agents are declared once in
  * `.pi/agents/*.md` and their frontmatter becomes the child's launch argv.
  *
- * Design: the child owns its pane (a PTY owned by the Luvus server), so every
+ * Design: the child owns its pane (a PTY owned by the tty7 server), so every
  * delegation is out-of-process by construction. `wait` decides only whether the
  * parent blocks; it does not change where the child runs.
  */
@@ -145,8 +145,8 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		name: "delegate",
 		label: "Subagent",
 		description:
-			"Delegate a task to a subagent running in a visible Luvus pane. wait: true (the default) blocks until it settles and returns its answer; wait: false returns as soon as the pane is up, and the answer arrives later as a completion message that wakes you — or, when you need it before your turn can end, wait for it with subagent_status wait: true. Use dry_run to inspect the resolved launch plan without starting anything.",
-		promptSnippet: "Delegate a task to a subagent running in a visible Luvus pane",
+			"Delegate a task to a subagent running in a visible tty7 pane. wait: true (the default) blocks until it settles and returns its answer; wait: false returns as soon as the pane is up, and the answer arrives later as a completion message that wakes you — or, when you need it before your turn can end, wait for it with subagent_status wait: true. Use dry_run to inspect the resolved launch plan without starting anything.",
+		promptSnippet: "Delegate a task to a subagent running in a visible tty7 pane",
 		// The delegation policy, tuned from the subagents fork: when to reach for an
 		// agent, when to search directly instead, and what the answer means. Three rules,
 		// not five: the catalogue already says which agent fits, the mechanism is in the
@@ -458,7 +458,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 		name: "steer",
 		label: "Steer subagent",
 		description:
-			"Send an additional instruction to a subagent that is already running in its Luvus pane. Set interrupt to stop its current work first; a background delegation keeps its pane open for this.",
+			"Send an additional instruction to a subagent that is already running in its tty7 pane. Set interrupt to stop its current work first; a background delegation keeps its pane open for this.",
 		promptSnippet: "Send an additional instruction to a running subagent",
 		parameters: Type.Object({
 			sessionName: Type.String({ description: "Subagent session name, as returned by delegate" }),
@@ -511,7 +511,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	});
 
 	/**
-	 * Let the parent read its own delegations instead of scraping Luvus through bash:
+	 * Let the parent read its own delegations instead of scraping tty7 through bash:
 	 * the widget is for the human, and a bash `luvus wait` is auto-backgrounded by
 	 * whatever background-task extension happens to be installed.
 	 *

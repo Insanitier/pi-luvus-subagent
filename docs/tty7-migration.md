@@ -439,3 +439,33 @@ delegate / subagent_status / steer │ delivery · registry · outcome · handov
 5. 删除 `state-reporter.ts`、`stateAuthority`、`terminal_id` 栅栏、`WAIT_FLOOR_MS`；跑全套检查；更新 README 的设计段。
 
 **验收门槛**：同一份检查在两个底座上全绿；`npm run check` 零错误；README 的每条设计断言在新底座下仍成立（不成立的就改 README，而不是让代码悄悄违背它）。
+
+
+---
+
+## 9. 执行结果（2026-10-21，已落地）
+
+按 §7.8 的分层替换执行完毕，共三个提交：`395f286`（新底座）、`f8feff7`（接线）、`976a413`（检查网）。
+
+| 项 | 结果 |
+| --- | --- |
+| 新增 | `extensions/luvus-subagent/tty7.ts`：`split/send/capture/agents/wait/pane close` + 就绪证明 + `turns`/记录游标 |
+| 删除 | `luvus.ts`(266)、`state-reporter.ts`(164)、`editor.ts`(65)，以及 `SELF_PATH`/`SUBAGENT_CHILD_FLAG`/`terminal_id` 栅栏 |
+| 子进程 argv | 不再带 `--extension`/`--subagent-child`：子进程是普通 `pi`，状态由 tty7 的 hook 上报，且天然不能派子代理 |
+| 检查 | `verify.mjs` 的 luvus 桩换成 tty7 桩，**105/105 通过**；`tsc --noEmit` 干净 |
+| 真机冒烟 | `split` 得 pane 10，tty7 以我们钉的 `session_id` 认领子进程（`inferred: false`），粘贴→回车→`waitForSettle`→`readChildResult` 得 `SMOKE_OK`，pane 关闭 |
+
+### 9.1 计划里没料到、被检查抓出来的三件事
+
+1. **结束判定的输入必须是转录记录，不能是状态**。实现时先用 `turns` 增量，被"子进程启动那一轮先 done"打脸：`waitForSettle` 在进入时取基线，可那时子进程已经 done ⇒ 永远等不到更大的 turns。最终规则：
+   `terminalRecordAt(session) > taskRecordAt(session, task)` —— 任务那条 user 记录**之后**出现终态记录才算这一轮结束。`wait` 只是门铃。
+2. **地址只能是 pane**。`submitAndConfirm` 原来把 session 名当 pane 用（Luvus 用名字寻址），tty7 用 pane id ⇒ 粘贴发到了不存在的目标。顺手把 `steer` 的"名字→pane"解析交给 tty7 自己（`agents --json` 的 `session_id`），跨会话也能 steer。
+3. **后台 watcher 的游标不能在 `continued` 后前进**。否则"续写的那一版答案"（已经在窗口里写进转录）永远不会被认账，只会一直等到超时；游标停在旧终点，下一轮立刻就能认出更新的那条。
+
+另外两条**产品行为**修正：启动失败（没有 tty7 / 没有可 split 的 pane / 子进程没起来）必须是工具结果而不是异常；"终态但一个字都没有"归为 `no-answer`，而不是 `done` + `(no output)`。
+
+### 9.2 仍然悬着（不在本次范围）
+
+- `tty7 doctor` 报 **Pi hooks OUTDATED**（22 个未安装）：GUI 里 **Settings → Integrations → Pi → Update**，不动 server、不杀 pane。状态上报的完整度取决于它。
+- 包名/仓库名仍是 `pi-luvus-subagent`；改名要动 `package.json`、README、keywords、仓库设置，是独立变更。
+- `PI_SUBAGENT_STATE_CONFIRM_MS` 保留了 `LUVUS_SUBAGENT_STATE_CONFIRM_MS` 作为回退读法，只有老测试环境会用到。

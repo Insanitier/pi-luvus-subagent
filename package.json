@@ -1,12 +1,12 @@
 {
 	"name": "pi-luvus-subagent",
 	"version": "0.1.0",
-	"description": "Luvus-backed subagents for Pi: agent presets from .pi/agents, visible panes, steerable, blocking or background",
+	"description": "tty7-backed subagents for Pi: agent presets from .pi/agents, visible panes, steerable, blocking or background",
 	"keywords": [
 		"pi-package",
 		"pi",
 		"subagent",
-		"luvus",
+		"tty7",
 		"delegation"
 	],
 	"license": "MIT",
