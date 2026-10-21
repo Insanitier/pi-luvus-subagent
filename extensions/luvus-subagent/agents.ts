@@ -12,9 +12,7 @@ import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/
 import {
 	PROMPT_DIR,
 	PROMPT_FILE_MODE,
-	SELF_PATH,
 	SESSION_DIR,
-	SUBAGENT_CHILD_FLAG,
 	isDirectory,
 	THINKING_LEVELS,
 	skillRoots,
@@ -235,10 +233,10 @@ export function prepareLaunch(
 			? ["--session-dir", SESSION_DIR, "--session-id", sessionName, "--name", sessionName]
 			: ["--session", resumeFile];
 
-	// The child loads this same extension, which is what installs its reporter.
-	if (SELF_PATH !== undefined && existsSync(SELF_PATH)) args.push("--extension", SELF_PATH);
-	// Reporting yes, delegating no: a subagent must not spawn subagents.
-	args.push(`--${SUBAGENT_CHILD_FLAG}`);
+	// Nothing else is passed on purpose. The child is a plain `pi` in a tty7 pane: tty7's
+	// own agent hook reports its status from the child's events (`inferred: false`), so the
+	// child needs no reporter of ours, and it never loads this extension, so it cannot spawn
+	// subagents of its own.
 
 	if (agent.model !== undefined) args.push("--model", agent.model);
 	if (agent.thinking !== undefined) args.push("--thinking", agent.thinking);

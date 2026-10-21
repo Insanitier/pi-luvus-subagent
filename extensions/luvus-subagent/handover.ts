@@ -1,22 +1,25 @@
 /**
  * Handing a task to a child, and reading back whether it took it.
  *
- * Two steps, because one is not enough: `agent prompt` pastes the text, and a long multi-line
- * paste is *not* submitted by it. The evidence is the child's own transcript — not its state,
- * because a status describes the pane and this is about *this* text.
+ * Two steps, because one is not enough: the paste puts the text in the child's editor, and a
+ * long multi-line paste is *not* submitted by it. The evidence is the child's own transcript —
+ * not its state, because a status describes the pane and this is about *this* text.
  *
  * A resume is the case that makes the evidence subtle: the session file already holds older
  * user messages, so "a user line mentions the task" can be true before anything was pasted.
  * The caller hands in where the transcript stood, and only what arrived after that counts.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { TASK_MARK_IN_PANE_CHARS, readSessionRecords, sessionFileFor, taskInTranscript } from "./child-session.ts";
-import { LuvusError, PROMPT_SUBMIT_TIMEOUT_MS, START_POLL_MS, callLuvus, pressKey, readPane } from "./luvus.ts";
-import { rememberTerminal } from "./registry.ts";
+import { PROMPT_FILE_MODE } from "./env.ts";
+import { START_POLL_MS, Tty7Error, pressKey, readPane, typeText } from "./tty7.ts";
 /** How a handover ended: the child wrote the task down, or it did not, or nothing was sent. */
 export type Handover =
 	| { state: "taken" }
-	| { state: "unsent"; code: string | undefined }
+	| { state: "unsent"; code: number | undefined }
 	| { state: "queued"; presses: number; unsentInComposer: boolean };
 
 /** How many records the child's transcript holds, as the baseline a handover is read against. */
@@ -53,26 +56,28 @@ export async function submitAndConfirm(
 	sessionName: string,
 	task: string,
 	seconds: number,
-	fence?: string,
 ): Promise<Handover> {
 	// Where the transcript stood before the paste. A resumed session shows older user
 	// messages, and one of them can carry the same words — a parent that retries a task it
 	// already sent would otherwise be told the child took it, without a key being pressed.
 	const before = sessionRecordCount(sessionName);
-	// Paste, then submit: a long paste leaves the text sitting in the editor on its own.
+	// The body goes through a file rather than argv: `send --from-file` hands the bytes over
+	// exactly as written, so a task with quotes or newlines cannot arrive as a different text.
+	const dir = mkdtempSync(join(tmpdir(), "tty7-subagent-task-"));
+	const file = join(dir, "task.md");
+	writeFileSync(file, task, { encoding: "utf-8", mode: PROMPT_FILE_MODE });
 	try {
-		const prompt = ["agent", "prompt", sessionName, task];
-		// The host's own fence: it refuses the prompt unless the terminal behind the name is the
-		// one this id names (`content_revision_conflict`, measured). Only callers that have read
-		// the pane recently can pass one; at launch there is nothing to compare against yet.
-		if (fence !== undefined) prompt.push("--terminal-id", fence);
-		await callLuvus(pi, prompt, PROMPT_SUBMIT_TIMEOUT_MS);
+		// Paste, then submit: a long paste leaves the text sitting in the editor on its own.
+		await typeText(pi, sessionName, file);
 		await pressKey(pi, sessionName, "enter");
 	} catch (error) {
 		// A pane that went away mid-hand-over refuses the paste; the caller asks whether it
 		// is gone and reports that instead of a task that was never sent. The code rides along
 		// because "the pane is gone" and "the pane declined it" are different answers.
-		return { state: "unsent", code: error instanceof LuvusError ? error.code : undefined };
+		return { state: "unsent", code: error instanceof Tty7Error ? error.code : undefined };
+	} finally {
+		// The bytes are in the child's editor by now; the file's only job was the handover.
+		rmSync(dir, { recursive: true, force: true });
 	}
 	const deadline = Date.now() + seconds * 1000;
 	let presses = 1;
@@ -99,9 +104,6 @@ export async function submitAndConfirm(
  */
 export async function taskSitsUnsent(pi: ExtensionAPI, sessionName: string, task: string): Promise<boolean> {
 	const read = await readPane(pi, sessionName);
-	// A read taken here is also where a delegation first learns which terminal it is running
-	// in, so a steer much later can refuse a pane id that has changed hands since.
-	rememberTerminal(sessionName, read?.terminalId);
 	if (read === undefined) return false;
 	// Enough of the task to be unmistakable; the pane wraps and indents long lines.
 	return read.text.includes(task.slice(0, TASK_MARK_IN_PANE_CHARS));
@@ -109,9 +111,9 @@ export async function taskSitsUnsent(pi: ExtensionAPI, sessionName: string, task
 /**
  * One message's handover, in words: what was done to this child, and what it made of it.
  *
- * Four answers, and they call for four different moves: the child has it, the host refused it
+ * Four answers, and they call for four different moves: the child has it, the pane refused it
  * and said why, it is sitting unsent in the input box (the Enters did not land — steer again
- * to press Enter), or the host took it but nothing proves pickup yet.
+ * to press Enter), or the pane took it but nothing proves pickup yet.
  *
  * What both callers share is the four states themselves (`Handover`), not these sentences: a
  * launch words the same states with what only a launch knows — whether its pane still exists,
@@ -128,6 +130,6 @@ export function handoverText(verdict: Handover, target: string, verb: string): s
 	if (verdict.unsentInComposer) {
 		return `${verb} ${target} — the message is sitting in its input box unsent, so steer it again to press Enter.`;
 	}
-	return `${verb} ${target} — queued; the host took the message, but pickup is not confirmed.`;
+	return `${verb} ${target} — queued; the paste landed, but pickup is not confirmed.`;
 }
 

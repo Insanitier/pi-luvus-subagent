@@ -16,17 +16,15 @@ import { join } from "node:path";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { installStateReporter } from "./luvus-subagent/state-reporter.ts";
 import { answerAlreadyDelivered, awaitQuiescence, clearQueuedNotice, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation, wentBackToWorkNote } from "./luvus-subagent/delivery.ts";
 import { capCompletion, settledState, waitExpiredNote } from "./luvus-subagent/outcome.ts";
-import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberRead, rememberTerminal, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./luvus-subagent/registry.ts";
+import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberRead, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./luvus-subagent/registry.ts";
 import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./luvus-subagent/agents.ts";
 import { type ChildResult, readChildProgress, readChildResult, sessionFileFor } from "./luvus-subagent/child-session.ts";
-import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, luvusBinary, paneIsGone, pressKey, readPane, stateAuthority, waitForSettle } from "./luvus-subagent/luvus.ts";
+import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, paneAgent, paneIsGone, pressKey, waitForSettle } from "./luvus-subagent/tty7.ts";
 import { blockingResult, dryRunReport, launchChild } from "./luvus-subagent/flow.ts";
 import { handoverText, submitAndConfirm } from "./luvus-subagent/handover.ts";
-import { installRawPaste } from "./luvus-subagent/editor.ts";
-import { DELEGATION_ENTRY, SUBAGENT_CHILD_FLAG } from "./luvus-subagent/env.ts";
+import { DELEGATION_ENTRY } from "./luvus-subagent/env.ts";
 import { sweepExpiredPrompts, sweepOrphanSessions } from "./luvus-subagent/sweeps.ts";
 // The pieces the checks drive by name. They live in modules now; the entry keeps the
 // names stable, because a check that reaches into a moved file is a check that has to
@@ -36,24 +34,10 @@ export { discoverAgents, prepareLaunch, writePromptFile } from "./luvus-subagent
 // ── Extension entry ────────────────────────────────────────────────────────
 
 export default function luvusSubagent(pi: ExtensionAPI) {
-	// Loaded in the child too: this is what makes its pane report a real state.
-	installStateReporter(pi, luvusBinary);
-
-	// Registering keeps `--subagent-child` a legal option; the value is read from
-	// argv below, because pi only exposes flags from session_start onwards —
-	// too late to decide whether a tool gets registered at all.
-	pi.registerFlag(SUBAGENT_CHILD_FLAG, {
-		type: "boolean",
-		description: "Run as a subagent child: report state, but offer no delegation tools.",
-	});
-
-	// A child loads this extension for the reporter above, and for the editor that keeps
-	// a pasted task from reaching its model as a marker. Handing it the tools too would
-	// let subagents spawn subagents without bound.
-	if (process.argv.includes(`--${SUBAGENT_CHILD_FLAG}`)) {
-		installRawPaste(pi);
-		return;
-	}
+	// Nothing of ours runs in the child: a subagent is a plain `pi` in a tty7 pane, and
+	// tty7's own agent hook reports its status from the child's events. That is also why a
+	// subagent cannot spawn subagents — it never loads this extension, so it has no tool to
+	// delegate with.
 
 	/** Set while this session is being torn down, so a watcher never messages a dead one. */
 	let sessionStale = false;
@@ -322,14 +306,17 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					});
 					const reported = launch.status === undefined ? "no status" : `"${launch.status}"`;
 					const presses = `${started.presses} Enter${started.presses === 1 ? "" : "s"}`;
-					// The state that came back with the launch is reported *with the authority behind it*:
-					// a guess read off a booting screen is not the child saying anything, and a parent that
-					// cannot tell the two apart reads the guess as work in progress.
-					const source = await stateAuthority(pi, sessionName);
+					// The state that came back with the launch is reported *with where it came from*: tty7
+					// says whether an agent's status is the child reporting itself (`inferred: false`) or
+					// a guess read off a booting screen, and a parent that cannot tell the two apart
+					// reads the guess as work in progress.
+					const now = await paneAgent(pi, sessionName);
 					const whence =
-						source === undefined
-							? `the host reported ${reported} when the pane came up`
-							: `the host reported ${reported} when the pane came up, and its state now comes from ${source}`;
+						now === undefined
+							? `tty7 reported ${reported} when the pane came up and has nothing to say about it now`
+							: now.reported
+								? `tty7 reported ${reported} when the pane came up, and its state now comes from the child's own hooks`
+								: `tty7 reported ${reported} when the pane came up, and its state now is inferred from the screen`;
 					// Two failures wear the same face and call for opposite moves, so they are named
 					// apart: a task sitting in the input box is not lost and not running — it is waiting
 					// for the key that submits it, and pressing it again is the whole fix.
@@ -443,42 +430,16 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			try {
-				// Identity before delivery: the pane id is an integer the host hands out again after a
-				// close, so the terminal behind this name has to be the one this delegation was last
-				// seen in, or the message lands in a stranger's pane. A read that fails is not a
-				// verdict — a Luvus that cannot be reached has said nothing — so only a definite
-				// mismatch refuses here, and the same id rides along as the host's own fence.
-				const seen = await readPane(pi, params.sessionName);
-				const known = delegations.get(params.sessionName)?.terminalId;
-				if (seen?.terminalId !== undefined && known !== undefined && known !== seen.terminalId) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Not sent: the pane behind ${params.sessionName} is a different terminal now (it was ${known}, it is ${seen.terminalId}), so the message would have gone somewhere else. Its delegation is still in subagent_status.`,
-							},
-						],
-						isError: true,
-						details: {},
-					};
-				}
-				rememberTerminal(params.sessionName, seen?.terminalId);
 				if (params.interrupt === true) {
 					await pressKey(pi, params.sessionName, "esc");
 				}
 				const how = params.interrupt === true ? "Interrupted, then" : "Sent to";
 				// A steer has no launch reply to read: the child is normally already working, which
 				// is exactly when a status proves nothing. Its transcript is the evidence instead.
-				const verdict = await submitAndConfirm(
-					pi,
-					params.sessionName,
-					params.message,
-					STEER_CONFIRM_SECONDS,
-					seen?.terminalId,
-				);
-				// Four facts, and only four: the child wrote the message down, the host refused
-				// it and said why, it is sitting in the input box unsent, or it was accepted and
-				// not written down yet. One function says all four, so the delegate path and this
+				const verdict = await submitAndConfirm(pi, params.sessionName, params.message, STEER_CONFIRM_SECONDS);
+				// Four facts, and only four: the child wrote the message down, the pane refused
+				// it and said why, it is sitting in the input box unsent, or the paste landed and
+				// pickup is not confirmed yet. One function says all four, so the delegate path and this
 				// one cannot drift into two accounts of the same handover.
 				const text = handoverText(verdict, params.sessionName, how);
 				return { content: [{ type: "text", text }], details: {} };

@@ -10,8 +10,8 @@ import { formatArgv } from "./agents.ts";
 import type { ChildResult } from "./child-session.ts";
 import type { AgentToolResult, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Launch, SettleOutcome } from "./luvus.ts";
-import { startChild } from "./luvus.ts";
+import type { Launch, SettleOutcome } from "./tty7.ts";
+import { startChild } from "./tty7.ts";
 import { endedOf, outcomeLine, settledState, shownResult } from "./outcome.ts";
 import { trackDelegation } from "./registry.ts";
 

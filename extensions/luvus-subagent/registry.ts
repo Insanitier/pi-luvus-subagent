@@ -15,7 +15,7 @@
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { ChildProgress } from "./child-session.ts";
 import { DELEGATION_ENTRY, SETTLED_ENTRY } from "./env.ts";
-import { paneIsGone } from "./luvus.ts";
+import { paneIsGone } from "./tty7.ts";
 // ── Where a child is shown, and what the parent sees while it runs ─────────
 
 /** Key the status line and the widget are published under. */
@@ -37,13 +37,6 @@ export type Delegation = {
 	reportedAt?: number;
 	/** What the last read of this delegation saw, so the next one can say what changed. */
 	lastRead?: { at: number; toolUses: number };
-	/**
-	 * The terminal instance this delegation was last seen running in.
-	 *
-	 * The pane is a small integer the host hands out again after a close, the terminal id
-	 * is not — so this is what a later steer checks before it types into a stranger's pane.
-	 */
-	terminalId?: string;
 };
 
 /** How many parent turns the widget keeps a settled row, per the reference. */
@@ -271,17 +264,6 @@ export function alreadyReported(sessionName: string): boolean {
 	return delegations.get(sessionName)?.reportedAt !== undefined;
 }
 
-/**
- * Keep the terminal id a delegation is known by, so a later steer can tell it is still the
- * same terminal. A delegation this session never started is not tracked, and not tracking
- * it is not a failure: the read that learned the id simply had nothing to attach it to.
- */
-export function rememberTerminal(sessionName: string, terminalId: string | undefined): void {
-	if (terminalId === undefined) return;
-	const entry = delegations.get(sessionName);
-	if (entry === undefined || entry.terminalId === terminalId) return;
-	delegations.set(sessionName, { ...entry, terminalId });
-}
 
 /** The fields a replay reads; nothing else about an entry matters here. */
 export type ReplayEntry = { type: string; customType?: string; data?: unknown };

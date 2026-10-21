@@ -8,7 +8,7 @@
  * because a parent blocked on something that has not moved needs one.
  */
 import type { ChildOutcome, ChildResult } from "./child-session.ts";
-import type { SettleOutcome } from "./luvus.ts";
+import type { SettleOutcome } from "./tty7.ts";
 // ── Result from the child's own session ────────────────────────────────────
 
 /** Stop reasons that mean the assistant message is final rather than intermediate. */

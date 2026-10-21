@@ -349,6 +349,9 @@ export async function typeText(pi: ExtensionAPI, pane: string, file: string): Pr
 /** How a wait ended. `gone` is not a timeout: no state will ever arrive for that pane. */
 export type SettleOutcome = "settled" | "timeout" | "gone";
 
+/** What the pane looked like when a wait was armed. */
+export type Arm = { status: string; turns: number | undefined };
+
 /**
  * Wait for the child's next finished turn.
  *
@@ -363,9 +366,11 @@ export type SettleOutcome = "settled" | "timeout" | "gone";
 export async function waitForSettle(
 	pi: ExtensionAPI,
 	pane: string,
-	armed?: number,
+	arm?: Arm,
 ): Promise<SettleOutcome> {
-	const baseline = armed ?? (await paneTurns(pi, pane)) ?? 0;
+	// The pane as it stands when watching begins. `armed?.turns === undefined` covers both "no
+	// agent yet" and "an agent with no counter": either way a `done` seen later is new.
+	const armed = arm ?? (await paneAgent(pi, pane));
 	const deadline = Date.now() + WAIT_SECONDS * 1000;
 	for (;;) {
 		const remaining = Math.max(1, Math.round((deadline - Date.now()) / 1000));
@@ -375,19 +380,26 @@ export async function waitForSettle(
 			["wait", pane, "--until", "done,exit", "--timeout", String(remaining), "--json"],
 			(remaining + 10) * 1000,
 		);
-		// `1` is the pane dying under the wait; anything else that is not a clean answer (a
-		// timeout, a server that refused) is decided by asking the pane below.
+		// `1` is the pane dying under the wait; anything else that is not a clean answer is
+		// decided by asking the pane below.
 		if (reply.code === 1) return "gone";
-		const turns = await paneTurns(pi, pane);
-		if (turns !== undefined && turns > baseline) return "settled";
-		if (turns === undefined) {
+		const view = await paneAgent(pi, pane);
+		if (view === undefined) {
+			// No agent is not the same as no pane: a child that exited left its shell behind,
+			// and a pane that is gone will never report anything again.
 			if (await paneIsGone(pi, pane)) return "gone";
-			// An agent that is not reporting has no turn to count; a pane that is still there
-			// with no agent in it is a child that exited, which is an end, not a wait.
-			if ((await paneState(pi, pane)) === undefined) return "gone";
+		} else if (
+			view.status === "done" &&
+			(armed === undefined ||
+				armed.status !== "done" ||
+				(view.turns ?? 0) > (armed.turns ?? 0))
+		) {
+			return "settled";
 		}
 		if (Date.now() >= deadline) return "timeout";
 		const spent = Date.now() - cycleStart;
+		// A wait that answered a state which predates the work is skipped, not believed — and
+		// the floor is what stops that skip from becoming a spin.
 		if (spent < WAIT_FLOOR_MS) await new Promise((resolve) => setTimeout(resolve, WAIT_FLOOR_MS - spent));
 	}
 }

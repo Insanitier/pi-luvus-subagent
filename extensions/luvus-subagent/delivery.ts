@@ -22,7 +22,7 @@ import { rmSync } from "node:fs";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { childLastWriteAt, readChildResult, type ChildResult } from "./child-session.ts";
-import { START_POLL_MS, WAIT_FLOOR_MS, closePane, paneIsGone, paneState, waitForSettle, type SettleOutcome } from "./luvus.ts";
+import { START_POLL_MS, WAIT_FLOOR_MS, closePane, paneIsGone, paneState, waitForSettle, type SettleOutcome } from "./tty7.ts";
 import { COLLAPSED_LINES, COMPLETION_OUTPUT_CAP, capCompletion, endedOf, outcomeLine, settledState, shownResult } from "./outcome.ts";
 import { alreadyReported, delegations, markReported, settleDelegation } from "./registry.ts";
 /**
