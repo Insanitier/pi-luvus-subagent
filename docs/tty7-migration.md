@@ -142,6 +142,22 @@ tty7 send %6 'pi --session-dir ~/.pi/agent/subagent-sessions --session-id probe-
 2. **`since_ms` 在本机这个 server（26.9.4）里不存在**（JSON 里没有该字段，文档是给新版本的）
    ⇒ §8.3 的"窗口输入改用 `since_ms`"在本机不成立，必须用 **`turns` + 子会话文件 mtime** 作为"状态是否还在延续"的证据。
 
+#### 关于 `since_ms` 缺失——是哪一层缺（实测对账，2026-10-21）
+
+这台机器上同时存在**两个 server 二进制**，别混：
+
+| 文件 | 版本 | `strings \| grep -c since_ms` | mtime |
+| --- | --- | --- | --- |
+| `D:\Software\tty7\server\tty7-server-linux-x86_64-musl`（app 自带/会部署的） | **26.10.1-nightly.202610202101** | **2** | 10-21 |
+| `~/.local/share/tty7/bin/tty7-server-c12p6`（**正在跑**的 daemon） | **26.9.4** | **0** | **10-01** |
+| `D:\Software\tty7\tty7.exe`（Windows CLI） | 26.10.1-nightly | 3 | — |
+| `D:\Software\tty7\tty7-app.exe`（GUI） | 26.10.1-nightly | 4 | — |
+
+结论：**字段没被删，文档也没过期**——上游 main 仍在 `AgentState` 里定义它（`Option<u64>`，注释"`None` from a daemon that predates it"），
+最新那个 server 二进制里也有它；缺的原因是**正在跑的 daemon 是 10-01 那次安装留下的旧进程**，它自己不会升级。
+文档连这个降级都写明了（`tty7 agents` 的 `FOR` 列显示 `-`，实测就是 `-`）。
+要拿到它必须让 daemon 换新二进制重启——会杀掉全机所有 pane，只能由用户决定；我们的设计不依赖它。
+
 另外：`capture --plain --tail 18` 对 pi 的 TUI 只取到边框和状态行 ⇒ 印证 tty7 自己的建议——**结果走会话/文件，屏幕只作诊断**。
 
 **措辞修正**：不是"没有通道"，而是 **"pi→tty7 的状态上报通道有；pi→tty7 的控制通道缺客户端"**。两者不能互相替代：`agent-hook` 只能喂状态，不能开 pane / 发键 / 读屏 / 等状态。
