@@ -143,10 +143,14 @@ export function readChildResult(sessionId: string): ChildResult | undefined {
 			text: terminal.text.trim() || terminal.errorMessage?.trim() || `Subagent ${terminal.stopReason} before producing a result.`,
 		};
 	}
+	const text = terminal.text.trim();
+	// A turn that ended without writing anything is not an answer — it is its own state, and
+	// `(no output)` in a tool result reads as one that happened to be empty.
+	if (text.length === 0) return { status: "completed", outcome: "no-answer", text: "" };
 	return {
 		status: "completed",
 		outcome: terminal.stopReason === "length" ? "truncated" : "done",
-		text: terminal.text.trim() || "(no output)",
+		text,
 	};
 }
 
@@ -225,20 +229,45 @@ export function readChildProgress(sessionId: string): ChildProgress | undefined 
  * parent retrying a task with the same words would otherwise be told the child took it while
  * the text was still sitting in its editor.
  */
-export function taskInTranscript(sessionId: string, task: string, fromRecord = 0): boolean {
+/**
+ * The index of the user record that carries `task`, at or after `fromRecord`.
+ *
+ * The index is the point a settled turn is measured from: a terminal record *after* it is
+ * this task's ending, while one before it belongs to whatever the child was doing already.
+ */
+export function taskRecordAt(sessionId: string, task: string, fromRecord = 0): number | undefined {
 	const file = sessionFileFor(sessionId);
-	if (file === undefined) return false;
+	if (file === undefined) return undefined;
+	const mark = task.slice(0, TASK_MARK_CHARS);
 	// Whole records, not a filtered scan: the index this is asked about counts every record
 	// the file holds, so filtering first would move the boundary it is measured against.
-	const mark = task.slice(0, TASK_MARK_CHARS);
 	const records = readSessionRecords(file);
-	if (records === undefined) return false;
-	const said = records.slice(fromRecord) as { message?: { role?: string; content?: { type?: string; text?: string }[] } }[];
-	for (const record of said) {
-		const message = record.message;
+	if (records === undefined) return undefined;
+	for (let index = fromRecord; index < records.length; index += 1) {
+		const message = (records[index] as { message?: { role?: string; content?: { type?: string; text?: string }[] } })
+			.message;
 		if (message?.role !== "user" || !Array.isArray(message.content)) continue;
 		const said = message.content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("");
-		if (said.includes(mark)) return true;
+		if (said.includes(mark)) return index;
 	}
-	return false;
+	return undefined;
+}
+
+/** The index of the last assistant record that carries a terminal stop reason. */
+export function terminalRecordAt(sessionId: string): number | undefined {
+	const file = sessionFileFor(sessionId);
+	if (file === undefined) return undefined;
+	const records = readSessionRecords(file);
+	if (records === undefined) return undefined;
+	for (let index = records.length - 1; index >= 0; index -= 1) {
+		const message = (records[index] as { message?: { role?: string; stopReason?: string } }).message;
+		if (message?.role !== "assistant") continue;
+		if (typeof message.stopReason === "string" && TERMINAL_STOP_REASONS.has(message.stopReason)) return index;
+	}
+	return undefined;
+}
+
+/** Whether the child has taken a task whose text matches, at or after `fromRecord`. */
+export function taskInTranscript(sessionId: string, task: string, fromRecord = 0): boolean {
+	return taskRecordAt(sessionId, task, fromRecord) !== undefined;
 }

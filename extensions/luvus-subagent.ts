@@ -20,8 +20,8 @@ import { answerAlreadyDelivered, awaitQuiescence, clearQueuedNotice, deliverWhen
 import { capCompletion, settledState, waitExpiredNote } from "./luvus-subagent/outcome.ts";
 import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberRead, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./luvus-subagent/registry.ts";
 import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./luvus-subagent/agents.ts";
-import { type ChildResult, readChildProgress, readChildResult, sessionFileFor } from "./luvus-subagent/child-session.ts";
-import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, paneAgent, paneIsGone, pressKey, waitForSettle } from "./luvus-subagent/tty7.ts";
+import { type ChildResult, readChildProgress, readChildResult, sessionFileFor, terminalRecordAt } from "./luvus-subagent/child-session.ts";
+import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, paneAgent, paneForSession, paneIsGone, pressKey, waitForSettle } from "./luvus-subagent/tty7.ts";
 import { blockingResult, dryRunReport, launchChild } from "./luvus-subagent/flow.ts";
 import { handoverText, submitAndConfirm } from "./luvus-subagent/handover.ts";
 import { DELEGATION_ENTRY } from "./luvus-subagent/env.ts";
@@ -243,7 +243,24 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			if (promptFile !== undefined) writePromptFile(promptFile, agent.systemPrompt);
 
 			// 1. Launch the child in its own pane; the task follows as a message.
-			const launch = await launchChild(pi, sessionName, plan, ctx.hasUI ? ctx.ui : undefined);
+			// A launch that fails is a refusal like any other: no tty7 on PATH, no pane to split,
+			// a child that never came up. The parent asked for a delegation and gets the reason
+			// it did not happen, not an exception out of a tool call.
+			let launch: Awaited<ReturnType<typeof launchChild>>;
+			try {
+				launch = await launchChild(pi, sessionName, plan, ctx.hasUI ? ctx.ui : undefined);
+			} catch (error) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Could not launch ${sessionName}: ${error instanceof Error ? error.message : String(error)}`,
+						},
+					],
+					isError: true,
+					details: {},
+				};
+			}
 			const pane = launch.pane;
 			pi.appendEntry(DELEGATION_ENTRY, {
 				sessionName,
@@ -260,7 +277,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 			let outcome: SettleOutcome | undefined;
 			try {
 				// 2. Hand the task over, and let the child's own transcript say whether it took it.
-				const started = await submitAndConfirm(pi, sessionName, params.task, START_CONFIRM_SECONDS);
+				const started = await submitAndConfirm(pi, pane, sessionName, params.task, START_CONFIRM_SECONDS);
 				if (started.state === "unsent") {
 					// Nothing reached the child, so this is a failure however the pane looks.
 					settleDelegation(sessionName, "failed");
@@ -310,7 +327,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					// says whether an agent's status is the child reporting itself (`inferred: false`) or
 					// a guess read off a booting screen, and a parent that cannot tell the two apart
 					// reads the guess as work in progress.
-					const now = await paneAgent(pi, sessionName);
+					const now = await paneAgent(pi, pane);
 					const whence =
 						now === undefined
 							? `tty7 reported ${reported} when the pane came up and has nothing to say about it now`
@@ -326,15 +343,35 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: unpicked }], details: {}, isError: true };
 				}
 				if (wait) {
-					outcome = await waitForSettle(pi, pane);
+					outcome = await waitForSettle(
+						pi,
+						pane,
+						started.state === "taken" ? { sessionId: sessionName, after: started.record } : undefined,
+					);
 					settled = outcome === "settled";
 				}
 				const notes: string[] = [];
 				if (unresolvedSkills.length > 0) notes.push(`unresolved skills: ${unresolvedSkills.join(", ")}`);
 				if (!wait) {
+					// The task was pasted, but the pane is already gone: claiming a child is
+					// running in it would send the parent looking for a terminal that is not there.
+					if (await paneIsGone(pi, pane)) {
+						settleDelegation(sessionName, "failed");
+						recordDelivery(sessionName);
+						await teardownDelegation({ pi, pane, promptFile, settled: false });
+						return blockingResult(agent.name, "gone", undefined, []);
+					}
 					// Nothing awaits this: the delegation returns now, and the watcher
 					// reports the result once the child settles.
-					void deliverWhenSettled({ pi, pane, sessionId: sessionName, agentName: agent.name, promptFile, isStale: () => sessionStale });
+					void deliverWhenSettled({
+						pi,
+						pane,
+						sessionId: sessionName,
+						agentName: agent.name,
+						promptFile,
+						after: started.record,
+						isStale: () => sessionStale,
+					});
 					const notice = [
 						`${resumeFile === undefined ? "Delegated to" : "Resumed"} ${sessionName} in pane ${pane} (running).`,
 						"It keeps running there; the pane is visible and steerable.",
@@ -367,6 +404,8 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 							sessionId: sessionName,
 							agentName: agent.name,
 							promptFile,
+							// From the ending that just happened: what comes next is the continuation.
+							after: terminalRecordAt(sessionName) ?? started.record,
 							isStale: () => sessionStale,
 						});
 						// No answer in this result: it says what the child is doing, not what it said.
@@ -387,6 +426,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 						sessionId: sessionName,
 						agentName: agent.name,
 						promptFile,
+						after: terminalRecordAt(sessionName) ?? started.record,
 						isStale: () => sessionStale,
 					});
 				}
@@ -430,13 +470,30 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			try {
+				// The pane is the address; the session name is what the transcript is filed under.
+				// This session's own records answer first, and tty7 is asked next: the launch pins
+				// the session id, so a name resolves to its pane even from a session that never
+				// started that delegation.
+				const pane = delegations.get(params.sessionName)?.pane ?? (await paneForSession(pi, params.sessionName));
+				if (pane === undefined) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Not sent: tty7 has no pane running ${params.sessionName}, so there is nothing to type into.`,
+							},
+						],
+						isError: true,
+						details: {},
+					};
+				}
 				if (params.interrupt === true) {
-					await pressKey(pi, params.sessionName, "esc");
+					await pressKey(pi, pane, "esc");
 				}
 				const how = params.interrupt === true ? "Interrupted, then" : "Sent to";
 				// A steer has no launch reply to read: the child is normally already working, which
 				// is exactly when a status proves nothing. Its transcript is the evidence instead.
-				const verdict = await submitAndConfirm(pi, params.sessionName, params.message, STEER_CONFIRM_SECONDS);
+				const verdict = await submitAndConfirm(pi, pane, params.sessionName, params.message, STEER_CONFIRM_SECONDS);
 				// Four facts, and only four: the child wrote the message down, the pane refused
 				// it and said why, it is sitting in the input box unsent, or the paste landed and
 				// pickup is not confirmed yet. One function says all four, so the delegate path and this

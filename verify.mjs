@@ -8,13 +8,13 @@
  *
  *   1. the module parses and loads (type stripping + the whole import graph)
  *   2. agent discovery, and the argv each fixture agent resolves to
- *   3. one whole delegation against a stub `luvus`: launch, task submit, settle
+ *   3. one whole delegation against a stub `tty7`: launch, task submit, settle
  *      detection, result extraction, the completion notice, the widget frames,
  *      the prompt-file delete and the pane close
  *   4. the orphan sweep: which child sessions a launch reaps, which it keeps, and
  *      what it does when it cannot trust what it read
  *
- * Isolation: HOME, PI_CODING_AGENT_DIR and LUVUS_BIN_PATH all point into a temp
+ * Isolation: HOME, PI_CODING_AGENT_DIR and PI_TTY7_BIN all point into a temp
  * dir, so nothing here touches the real ~/.pi/agent, a real session file, or a
  * real pane. Run it with `node verify.mjs` (or `npm test`).
  */
@@ -65,7 +65,12 @@ registerHooks({
 // seconds, which is right for a child and wrong for a suite — so it is nearly zero here, and the
 // checks that are about the window itself set their own. Everything else is about what happens
 // *after* an end, and reads the same either way.
-process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS = "0";
+process.env.PI_SUBAGENT_STATE_CONFIRM_MS = "0";
+// A wait that can run out must do it in seconds here, not in fifteen minutes.
+process.env.PI_SUBAGENT_WAIT_SECONDS = "3";
+// The handover window is fifteen seconds in production; here it must not be.
+process.env.PI_SUBAGENT_CONFIRM_SECONDS = "3";
+process.env.PI_SUBAGENT_READY_SECONDS = "5";
 const HOME = join(tmpdir(), `luvus-verify-${process.pid}`);
 const AGENT_DIR = join(HOME, ".pi", "agent");
 const SESSION_DIR = join(AGENT_DIR, "subagent-sessions");
@@ -105,130 +110,251 @@ writeFileSync(
 	].join("\n"),
 );
 
-// ── 2. A stub `luvus`: canned envelopes, and it writes the child's session ───
-const STUB = join(HOME, "luvus-stub.mjs");
+// ── 2. A stub `tty7`: canned envelopes, and it writes the child's session ───
+const STUB = join(HOME, "tty7-stub.mjs");
 const STUB_LOG = join(HOME, "stub.log");
 writeFileSync(STUB_LOG, "");
+const PANE = "42";
 writeFileSync(
 	STUB,
 	`#!/usr/bin/env node
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const argv = process.argv.slice(2);
-appendFileSync(process.env.LUVUS_STUB_LOG, argv.join(" ") + "\\n");
-const ok = (result) => { process.stdout.write(JSON.stringify({ result })); process.exit(0); };
+appendFileSync(process.env.TTY7_STUB_LOG, argv.join(" ") + "\\n");
 const sessionDir = join(process.env.HOME, ".pi", "agent", "subagent-sessions");
-if (argv[0] === "agent" && argv[1] === "start") {
-	// A fresh child is idle, whatever a previous delegation under this name left behind.
-	// ready/status are what the real CLI answers once the pane is up, and that reply is
-	// the only state the parent may read: asking again lands while the pane is still
-	// starting, where Luvus' answer is a guess read off the screen.
-	// A name of busy-pane… models a pane that already has a child working in it.
-	const busy = argv[2].includes("busy-pane");
-	writeFileSync(join(sessionDir, argv[2] + ".state"), busy ? "working" : "idle");
-	ok({ pane: "42", ready: true, status: busy ? "working" : "idle" });
+mkdirSync(sessionDir, { recursive: true });
+const panesFile = join(sessionDir, "panes.json");
+const panes = () => (existsSync(panesFile) ? JSON.parse(readFileSync(panesFile, "utf-8")) : {});
+const save = (all) => writeFileSync(panesFile, JSON.stringify(all));
+const out = (value) => { process.stdout.write(JSON.stringify(value)); process.exit(0); };
+const gone = process.env.TTY7_STUB_GONE === "1";
+const paneOf = (arg) => (arg === undefined ? "42" : String(arg).replace(/^%/, ""));
+const file = (pane, suffix) => join(sessionDir, "pane-" + pane + "." + suffix);
+
+// ── split: a new pane, idle, with no agent in it yet ────────────────────────
+if (argv[0] === "split") {
+	const all = panes();
+	// The host reuses a pane id once its pane is closed, so the lowest free one is allocated:
+	// tests that expect the first delegation to be pane 42 keep working, and two children at
+	// once get 42 and 43 instead of overwriting each other.
+	let id = 42;
+	while (all[String(id)] !== undefined && all[String(id)].live !== false) id += 1;
+	all[String(id)] = { live: true, status: "none", name: null, turns: 0 };
+	save(all);
+	out({ pane: id });
 }
-if (process.env.LUVUS_STUB_GONE === "1" && argv[0] === "agent" && (argv[1] === "prompt" || argv[1] === "keys")) {
-	// A pane that is gone refuses the paste the way the real CLI does, instead of quietly
-	// accepting text nothing can receive.
-	process.stdout.write(JSON.stringify({ error: { code: "not_found", message: "agent target not found" } }));
-	process.exit(1);
-}
-if (argv[0] === "agent" && argv[1] === "prompt") {
-	// Pasting is not submitting: Luvus puts the text in the child's input box, and the
-	// transcript only gains the turn once an Enter arrives — measured against the real
-	// CLI, where a 12-line paste sat unsent until a separate agent keys <target> enter.
-	mkdirSync(sessionDir, { recursive: true });
-	writeFileSync(join(sessionDir, argv[2] + ".pending"), argv[3]);
-	ok({ submitted: true });
-}
-if (argv[0] === "agent" && argv[1] === "keys" && argv[3] === "enter") {
-	const pending = join(sessionDir, argv[2] + ".pending");
-	// A task text of NEVER_PICKED is a child that never starts working, Enter or not.
-	const task = existsSync(pending) ? readFileSync(pending, "utf-8") : "NEVER_PICKED";
-	// Counting the presses is what models a child that swallows an Enter: measured against a
-	// real pane, the first one went nowhere while the child was still drawing its banner and
-	// the task sat in its composer. STUBBORN_TASK keeps that shape.
-	const presses = join(sessionDir, argv[2] + ".presses");
-	const count = (existsSync(presses) ? Number(readFileSync(presses, "utf-8")) : 0) + 1;
-	writeFileSync(presses, String(count));
-	if (task === "STUBBORN_TASK" && count === 1) ok({ swallowed: true });
-	// The host's view of the child: idle until the Enter lands, then working. NEVER_PICKED
-	// never leaves idle, which is what an unpicked delegation looks like from here.
-	writeFileSync(join(sessionDir, argv[2] + ".state"), task === "NEVER_PICKED" ? "idle" : "working");
-	if (task !== "NEVER_PICKED") {
-		const file = join(sessionDir, "1970-01-01T00-00-00-000Z_" + argv[2] + ".jsonl");
-		const terminal = task === "ERRORED_TASK"
+
+// ── send: the three shapes this extension uses ──────────────────────────────
+if (argv[0] === "send") {
+	const pane = paneOf(argv[1]);
+	const all = panes();
+	if (all[pane] === undefined || all[pane].live === false) {
+		process.stderr.write("pane not found\\n");
+		process.exit(1);
+	}
+	const rest = argv.slice(2);
+	const key = rest.includes("--key") ? rest[rest.indexOf("--key") + 1] : undefined;
+	const fromFile = rest.includes("--from-file") ? rest[rest.indexOf("--from-file") + 1] : undefined;
+	// A launch: the pane's shell starts the child, so the pane gains an agent whose session id
+	// is the one the argv pinned — that id is what the extension proves readiness with.
+	if (key === undefined && fromFile === undefined && rest.some((part) => part !== "--enter" && part !== "--paste")) {
+		const line = rest.filter((part) => part !== "--enter" && part !== "--paste").join(" ");
+		const pinned = /'--session-id'\\s+'([^']+)'/.exec(line);
+		const resumed = /'--session'\\s+'([^']+)'/.exec(line);
+		const name = pinned !== null
+			? pinned[1]
+			: resumed !== null
+				? resumed[1].split("/").pop().replace(/^[^_]*_/, "").replace(/\\.jsonl$/, "")
+				: null;
+		// A fresh pane can swallow the Enter that followed the text; the command then sits on
+		// the prompt until another Enter arrives, which is the state STUB_SWALLOW models.
+		if (process.env.TTY7_STUB_SWALLOW === "1" && !existsSync(file(pane, "entered"))) {
+			writeFileSync(file(pane, "sitting"), line);
+			out({});
+		}
+		writeFileSync(file(pane, "sitting"), "");
+		if (name !== null) {
+			all[pane] = { live: true, status: name.includes("busy-pane") ? "working" : "idle", name, turns: name.includes("busy-pane") ? 1 : 0 };
+			save(all);
+		}
+		out({});
+	}
+	// Enter with nothing typed is either the lost carriage return (a command sitting on the
+	// prompt) or the key that submits a paste — never both.
+	if (key === "enter") {
+		const sitting = existsSync(file(pane, "sitting")) ? readFileSync(file(pane, "sitting"), "utf-8") : "";
+		if (sitting !== "") {
+			writeFileSync(file(pane, "entered"), "1");
+			writeFileSync(file(pane, "sitting"), "");
+			const pinned = /'--session-id'\\s+'([^']+)'/.exec(sitting);
+			const resumed = /'--session'\\s+'([^']+)'/.exec(sitting);
+			const name = pinned !== null
+				? pinned[1]
+				: resumed !== null
+					? resumed[1].split("/").pop().replace(/^[^_]*_/, "").replace(/\\.jsonl$/, "")
+					: null;
+			if (name !== null) {
+				all[pane] = { live: true, status: "idle", name, turns: 0 };
+				save(all);
+			}
+			out({});
+		}
+	}
+	if (key !== undefined && key !== "enter") {
+		// Esc and friends: the child is interrupted, so it reports itself working again.
+		const entry = all[pane];
+		if (entry !== undefined) { entry.status = "working"; save(all); }
+		out({});
+	}
+	if (fromFile !== undefined) {
+		// Pasting is not submitting: the text lands in the child's input box, and the pane's
+		// agent learns nothing until an Enter arrives.
+		writeFileSync(file(pane, "pending"), readFileSync(fromFile, "utf-8"));
+		out({});
+	}
+	if (key === "enter") {
+		const pending = existsSync(file(pane, "pending")) ? readFileSync(file(pane, "pending"), "utf-8") : "NEVER_PICKED";
+		const pressesFile = file(pane, "presses");
+		const count = (existsSync(pressesFile) ? Number(readFileSync(pressesFile, "utf-8")) : 0) + 1;
+		writeFileSync(pressesFile, String(count));
+		// A child that swallows this Enter: the text stays in the composer and nothing starts.
+		if (pending === "STUBBORN_TASK" && count === 1) out({});
+		const entry = all[pane];
+		if (entry === undefined) out({});
+		if (pending === "NEVER_PICKED") {
+			// Nothing was ever pasted, so the child stays idle and no turn is started.
+			out({});
+		}
+		// A child that never settles is working, not finished: the turn started and has not
+		// ended, so the transcript gains the user line and no terminal record.
+		entry.status = process.env.TTY7_STUB_UNSETTLED === "1" ? "working" : "done";
+		entry.turns = (entry.turns ?? 0) + 1;
+		save(all);
+		writeFileSync(file(pane, "pending"), "");
+		if (process.env.TTY7_STUB_UNSETTLED === "1") {
+			appendFileSync(
+				join(sessionDir, "1970-01-01T00-00-00-000Z_" + entry.name + ".jsonl"),
+				(existsSync(join(sessionDir, "1970-01-01T00-00-00-000Z_" + entry.name + ".jsonl")) ? "\\n" : "") +
+					[
+						JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: pending }] } }),
+						JSON.stringify({
+							type: "message",
+							message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: {} }] },
+						}),
+					].join("\\n"),
+			);
+			out({});
+		}
+		const terminal = pending === "ERRORED_TASK"
 			? { role: "assistant", stopReason: "error", errorMessage: "upstream: connection reset", content: [] }
-			: task === "ABORTED_WITH_OUTPUT_TASK"
-				? {
-						role: "assistant",
-						stopReason: "aborted",
-						errorMessage: "Operation aborted",
-						content: [{ type: "text", text: "STUB_PARTIAL_ANSWER" }],
-					}
-				: task === "NO_ANSWER_TASK"
-					? undefined
+			: pending === "ABORTED_WITH_OUTPUT_TASK"
+				? { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted", content: [{ type: "text", text: "STUB_PARTIAL_ANSWER" }] }
+				: pending === "NO_ANSWER_TASK"
+					? { role: "assistant", stopReason: "stop", content: [] }
 					: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] };
-		appendFileSync(file, (existsSync(file) ? "\\n" : "") + [
-			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: task }] } }),
-			// A child that has been running has called a tool by now, and the progress line a
-			// read returns counts exactly these: without one there is nothing to count.
+		const transcript = join(sessionDir, "1970-01-01T00-00-00-000Z_" + entry.name + ".jsonl");
+		appendFileSync(transcript, (existsSync(transcript) ? "\\n" : "") + [
+			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: pending }] } }),
 			JSON.stringify({
 				type: "message",
 				message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: {} }] },
 			}),
 			...(terminal === undefined ? [] : [JSON.stringify({ type: "message", message: terminal })]),
 		].join("\\n"));
+		out({});
 	}
-	ok({});
+	out({});
 }
-if (argv[0] === "agent" && argv[1] === "read") {
-	// The composer holds the paste until something submits it: this is what a handover reads
-	// when its Enters did not land, to tell a task waiting for a key from one never sent.
-	const pending = join(sessionDir, argv[2] + ".pending");
-	const task = existsSync(pending) ? readFileSync(pending, "utf-8") : "";
-	// The terminal id is the pane's identity across a close, so it is read from a file a test
-	// can rewrite: that is how a pane which changed hands since is modelled.
-	const terminal = join(sessionDir, argv[2] + ".terminal");
-	const terminalId = existsSync(terminal)
-		? readFileSync(terminal, "utf-8")
-		: "deadbeefdeadbeefdeadbeefdeadbeef";
-	ok({ text: task === "" ? "no pending input" : "\u276f " + task, terminal_id: terminalId });
+
+// ── agents: the report the extension reads status, turns and identity from ──
+if (argv[0] === "agents") {
+	const all = panes();
+	const list = Object.entries(all)
+		.filter(([, entry]) => entry.name !== null && entry.live)
+		.map(([pane, entry]) => ({
+			pane_id: Number(pane),
+			agent: "Pi",
+			state: {
+				status: gone ? "no-agent" : entry.status,
+				message: null,
+				session_id: entry.name,
+				launch_argv: ["pi"],
+				rich: true,
+				cwd: null,
+				activity: 0,
+				turns: entry.turns ?? 0,
+				inferred: false,
+				readout: { permission_mode: null, model: null, effort: null },
+			},
+		}))
+		;
+	out({ agents: list });
 }
-if (argv[0] === "agent" && argv[1] === "explain") {
-	// The evidence behind a status: a pane whose state nothing reported is a guess read off
-	// the screen, which is the difference a parent needs when the status is surprising.
-	const task = existsSync(join(sessionDir, argv[2] + ".pending"))
-		? readFileSync(join(sessionDir, argv[2] + ".pending"), "utf-8")
-		: "";
-	ok({
-		status: task === "NEVER_PICKED" ? "idle" : "working",
-		state_evidence: { source: task === "NEVER_PICKED" ? "command_fallback" : "integration_report" },
-		authority: { source: task === "NEVER_PICKED" ? "command_fallback" : "pi/extension" },
+
+// ── capture --plain: the screen, which is only ever diagnostics ────────────
+if (argv[0] === "capture") {
+	const pane = paneOf(argv[1]);
+	if (gone) { process.stderr.write("pane not found\\n"); process.exit(1); }
+	const pending = existsSync(file(pane, "pending")) ? readFileSync(file(pane, "pending"), "utf-8") : "";
+	const sitting = existsSync(file(pane, "sitting")) ? readFileSync(file(pane, "sitting"), "utf-8") : "";
+	if (sitting !== "") process.stdout.write("~/proj $ " + sitting + "\\n");
+	else if (pending !== "") process.stdout.write("\u276f " + pending + "\\n");
+	else process.stdout.write("~/proj $\\n");
+	process.exit(0);
+}
+
+// ── pane ls: whether the pane itself still exists ──────────────────────────
+if (argv[0] === "pane" && argv[1] === "ls") {
+	const all = panes();
+	out({
+		panes: Object.keys(all).filter((pane) => !gone).map((pane) => ({
+			pane: Number(pane), workspace: "w", tab: "t", cwd: "/tmp", live: true, hibernated: false,
+		})),
 	});
 }
-if (argv[0] === "wait") process.exit(process.env.LUVUS_STUB_GONE === "1" ? 2 : process.env.LUVUS_STUB_UNSETTLED === "1" ? 1 : 0);
-if (argv[0] === "agent" && argv[1] === "get") {
-	// A pane that is gone answers with the envelope Luvus uses, and a non-zero exit.
-	if (process.env.LUVUS_STUB_GONE === "1") {
-		process.stdout.write(JSON.stringify({ error: { code: "not_found", message: "agent target not found" } }));
-		process.exit(1);
+
+// ── wait: the orchestration primitive, with the exit codes that distinguish endings
+if (argv[0] === "wait") {
+	const pane = paneOf(argv[1]);
+	if (gone) process.exit(1);
+	if (process.env.TTY7_STUB_UNSETTLED === "1") process.exit(124);
+	const all = panes();
+	const entry = all[pane] ?? { status: "done" };
+	// A wait that answers has watched the turn end, so the child's own transcript gains the
+	// record that says so — which is what the extension trusts over any status.
+	if (entry.name !== undefined && entry.name !== null) {
+		const transcript = join(sessionDir, "1970-01-01T00-00-00-000Z_" + entry.name + ".jsonl");
+		const lines = existsSync(transcript) ? readFileSync(transcript, "utf-8").split("\\n").filter((line) => line !== "") : [];
+		const last = lines.length === 0 ? undefined : JSON.parse(lines[lines.length - 1]);
+		const ended = typeof last?.message?.stopReason === "string";
+		if (!ended) {
+			appendFileSync(
+				transcript,
+				(lines.length > 0 ? "\\n" : "") +
+					JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "STUB_ANSWER" }] } }),
+			);
+		}
+		entry.status = "done";
+		all[pane] = entry;
+		save(all);
 	}
-	// Measured against the real CLI: a fresh child is idle, and paste + Enter moves it
-	// to working within a second — which the submit reads instead of waiting on.
-	const state = join(sessionDir, argv[2] + ".state");
-	ok({ pane: argv[2], status: existsSync(state) ? readFileSync(state, "utf-8") : "idle" });
+	out({ pane: Number(pane), status: entry.status, matched: true, stale: false, activity: 0, message: null, session_id: entry.name ?? null });
 }
-if (argv[0] === "agent" && argv[1] === "report") ok({});
-if (argv[0] === "agent" && argv[1] === "release") ok({});
-if (argv[0] === "pane" && argv[1] === "close") ok({});
-ok({});
+
+if (argv[0] === "pane" && argv[1] === "close") {
+	const pane = paneOf(argv[2]);
+	const all = panes();
+	if (all[pane] !== undefined) { all[pane].live = false; save(all); }
+	out({});
+}
+if (argv[0] === "status") out({ pid: 1, build: "26.9.4", control_version: 12, protocol_version: 6 });
+out({});
 `,
 );
 chmodSync(STUB, 0o755);
-process.env.LUVUS_BIN_PATH = STUB;
-process.env.LUVUS_STUB_LOG = STUB_LOG;
+process.env.PI_TTY7_BIN = STUB;
+process.env.TTY7_STUB_LOG = STUB_LOG;
 
 // ── 2b. A stub `trash`, so a reaped transcript is logged, not destroyed ──────
 // The sweep hands an orphan over the way Pi deletes a conversation: to `trash` if the
@@ -393,18 +519,18 @@ const result = await tools.delegate.execute(
 const text = result.content[0].text;
 check("tool result carries the child's answer", text.includes("STUB_ANSWER"), text.slice(0, 120));
 check("tool result reports the agent and status", text.startsWith("fixture-bare (done):"));
-// The launch reply already carried `ready` and `status`, so nothing may look the child's state up
-// to decide it started: a second lookup is what Luvus' guidance warns against, and what used to
-// decide a delegation had not started before the child could even finish booting. A lookup later
-// on is a different question — whether a child that reported a finished turn is working again —
-// so the check is scoped to the launch itself.
+// A launch is two moves — a pane of its own, and the child's own argv in it — and readiness is
+// not a status it guesses: it is tty7 reporting an agent in that pane under the session id the
+// argv pinned. That is what makes the launch of *our* child distinguishable from a pane that
+// already had somebody in it.
 const callLog = readFileSync(STUB_LOG, "utf-8").slice(callLogBefore).trim().split("\n");
-const firstPrompt = callLog.findIndex((line) => line.startsWith("agent prompt "));
+const firstPaste = callLog.findIndex((line) => /^send \d+ --from-file /.test(line));
 check(
-	"the launch reply is the only status read",
-	callLog[0].startsWith("agent start ") &&
-		firstPrompt > 0 &&
-		!callLog.slice(0, firstPrompt).some((line) => line.startsWith("agent get ")),
+	"a launch is a pane and the pinned session id, and readiness is that id",
+	callLog[0] === "split --vertical --json" &&
+		/^send \d+ exec /.test(callLog[1]) &&
+		callLog[1].includes("'--session-id'") &&
+		firstPaste > 1,
 	callLog.join(" | "),
 );
 
@@ -432,8 +558,14 @@ check(
 );
 
 const stubLog = readFileSync(STUB_LOG, "utf-8");
-check("the pane was closed at settle", stubLog.includes("pane close 42"), stubLog.trim().split("\n").join(" | "));
-check("the task was submitted as a prompt, not as argv", stubLog.includes("agent prompt fixture-bare-"));
+check("the pane was closed at settle", /pane close \d+/.test(stubLog), stubLog.trim().split("\n").join(" | "));
+// The task reaches the child through a file and a bracketed paste, so its text is never an
+// argument anywhere: not in this log, not in `ps`, not in a shell's history.
+check(
+	"the task was pasted from a file, never passed as argv",
+	/^send \d+ --from-file /m.test(stubLog) && !stubLog.includes("say the thing"),
+	stubLog.trim().split("\n").filter((line) => /^send \d+ --from-file /.test(line)).join(" | "),
+);
 const promptFilesLeft = readdirSync(PROMPT_DIR).filter((name) => !promptFilesBefore.has(name));
 check("the delegation deleted its own prompt file", promptFilesLeft.length === 0, promptFilesLeft.join(", "));
 
@@ -459,7 +591,7 @@ check(
 
 // Only this check wants the stub to report an unsettled wait; the happy path
 // above ran with the default (settled) behaviour.
-process.env.LUVUS_STUB_UNSETTLED = "1";
+process.env.TTY7_STUB_UNSETTLED = "1";
 const handoffLog = readFileSync(STUB_LOG, "utf-8").length;
 frames.length = 0;
 const unsettled = await tools.delegate.execute(
@@ -487,7 +619,7 @@ check(
 	"an unsettled child keeps its pane",
 	// The probe that ends a wait also logs, so this asks what the delegation did instead
 	// of what it logged last: it waited, and it never closed the pane afterwards.
-	readFileSync(STUB_LOG, "utf-8").trim().split("\n").findLastIndex((line) => line.startsWith("wait agent-status")) >
+	readFileSync(STUB_LOG, "utf-8").trim().split("\n").findLastIndex((line) => /^wait \d+ /.test(line)) >
 		readFileSync(STUB_LOG, "utf-8").trim().split("\n").findLastIndex((line) => line.startsWith("pane close")),
 	readFileSync(STUB_LOG, "utf-8").trim().split("\n").at(-1),
 );
@@ -498,7 +630,7 @@ await new Promise((resolve) => setTimeout(resolve, 800));
 const handedLog = readFileSync(STUB_LOG, "utf-8").slice(handoffLog).trim().split("\n");
 check(
 	"a blocking delegation that ran out is still watched",
-	handedLog.some((line) => line.startsWith("wait agent-status")),
+	handedLog.some((line) => /^wait \d+ /.test(line)),
 	handedLog.slice(0, 4).join(" | "),
 );
 const handedRows = (await tools.subagent_status.execute("verify-handed", {}, undefined, undefined, ctx)).content[0].text;
@@ -507,7 +639,7 @@ check(
 	/fixture-bare-[0-9a-f]{6}\s+working/.test(handedRows),
 	handedRows,
 );
-process.env.LUVUS_STUB_UNSETTLED = "";
+process.env.TTY7_STUB_UNSETTLED = "";
 
 // A resumed session already holds older user messages, so "a user line exists" would
 // report a picked-up task before the new one was ever submitted — and the task would sit
@@ -529,9 +661,10 @@ await tools.delegate.execute(
 );
 const resumeLogAfter = readFileSync(STUB_LOG, "utf-8").slice(resumeLogBefore.length);
 check(
-	"a resumed delegation submits through the host's own confirmation",
-	resumeLogAfter.includes(`agent prompt ${resumeId} the new task`) &&
-		resumeLogAfter.includes(`agent keys ${resumeId} enter`),
+	"a resumed delegation pastes the new task and presses Enter, instead of passing it on the command line",
+	/^send \d+ --from-file /m.test(resumeLogAfter) &&
+		/^send \d+ --key enter$/m.test(resumeLogAfter) &&
+		!resumeLogAfter.includes("the new task"),
 	resumeLogAfter.trim().split("\n").slice(0, 4).join(" | "),
 );
 
@@ -564,7 +697,7 @@ check(
 // this stub and close their panes, and every stub pane is 42, so they are held off while
 // this window is measured: the claim is about what *this* delegation does, not about an
 // id it shares with them.
-process.env.LUVUS_STUB_UNSETTLED = "1";
+process.env.TTY7_STUB_UNSETTLED = "1";
 frames.length = 0;
 const unpickedLogStart = readFileSync(STUB_LOG, "utf-8").length;
 const unpicked = await tools.delegate.execute(
@@ -575,13 +708,13 @@ const unpicked = await tools.delegate.execute(
 	ctx,
 );
 check(
-	"a task the child never took is unconfirmed, and names the authority behind its state",
+	"a task the child never took is unconfirmed, and names where its state comes from",
 	unpicked.isError === true &&
 		unpicked.content[0].text.includes("still has the task sitting in its input box") &&
 		unpicked.content[0].text.includes('"idle"') &&
 		// A guess read off the screen is not the child saying anything, and the message says
 		// which of the two it is instead of passing the guess on as a fact.
-		unpicked.content[0].text.includes("comes from command_fallback") &&
+		unpicked.content[0].text.includes("state now comes from the child's own hooks") &&
 		unpicked.content[0].text.includes("steer it to press that key again"),
 	unpicked.content[0].text,
 );
@@ -590,7 +723,7 @@ check(
 	!readFileSync(STUB_LOG, "utf-8").slice(unpickedLogStart).includes("pane close"),
 	readFileSync(STUB_LOG, "utf-8").slice(unpickedLogStart),
 );
-delete process.env.LUVUS_STUB_UNSETTLED;
+delete process.env.TTY7_STUB_UNSETTLED;
 const unpickedName = unpicked.content[0].text.match(/fixture-bare-[0-9a-f]{6}/)?.[0];const unpickedRow = (
 	await tools.subagent_status.execute("verify-unpicked-row", { sessionName: unpickedName }, undefined, undefined, ctx)
 ).content[0].text;
@@ -636,13 +769,13 @@ check(
 );
 // A pane that closed is a real failure, and the row the widget colours has to come from
 // one: an unconfirmed start is no longer recorded as a failure.
-process.env.LUVUS_STUB_GONE = "1";
+process.env.TTY7_STUB_GONE = "1";
 await tools.delegate.execute("verify-widget-failed", { agent: "fixture-bare", task: "go away" }, undefined, undefined, ctx);
-delete process.env.LUVUS_STUB_GONE;
+delete process.env.TTY7_STUB_GONE;
 // A settled row is drawn only beside a live one, and the widget is cleared once nothing
 // is running — so the failed row needs a delegation that stays live to be rendered at
 // all. UNSETTLED keeps the watcher from ending it, and the delegation is not awaited.
-process.env.LUVUS_STUB_UNSETTLED = "1";
+process.env.TTY7_STUB_UNSETTLED = "1";
 await tools.delegate.execute("verify-live-row", { agent: "fixture-bare", task: "stay", wait: false }, undefined, undefined, ctx);
 await new Promise((resolve) => setTimeout(resolve, 1500));
 const widgetLines = frames
@@ -650,7 +783,7 @@ const widgetLines = frames
 	.flatMap((frame) => frame.content);
 const failedRow = widgetLines.find((line) => /\u2039error\u203a\u2717\u2039\/error\u203a/.test(line) && line.includes("failed"));
 check("the widget shows a failed row in the error colour", failedRow !== undefined, widgetLines.join(" | "));
-delete process.env.LUVUS_STUB_UNSETTLED;
+delete process.env.TTY7_STUB_UNSETTLED;
 console.log("\nbackground delegation");
 frames.length = 0;
 await deliverQueued();
@@ -690,7 +823,7 @@ check(
 		noticeText(notices[0]).includes("STUB_ANSWER"),
 	JSON.stringify(notices[0]?.content ?? null),
 );
-check("the detached watcher closed the pane", readFileSync(STUB_LOG, "utf-8").includes("pane close 42"));
+check("the detached watcher closed the pane", /pane close \d+/.test(readFileSync(STUB_LOG, "utf-8")));
 // While the parent is streaming, Pi reads this mode: a steer lands after the current turn's
 // tool calls and before the next model call, where a follow-up waits for the whole turn to
 // end. While the parent is idle the two are the same, so this pins the choice that was made,
@@ -707,7 +840,7 @@ console.log("\nwaiting for a delegation");
 await deliverQueued();
 notices.length = 0;
 // A child that stays running: the watcher keeps watching, which is what a read can wait on.
-process.env.LUVUS_STUB_UNSETTLED = "1";
+process.env.TTY7_STUB_UNSETTLED = "1";
 const waiting = await tools.delegate.execute(
 	"verify-wait",
 	{ agent: "fixture-bare", task: "say the thing", wait: false },
@@ -759,7 +892,7 @@ check(
 	bounded.content[0].text,
 );
 // The read gave up, so the claim it took came back with it: the answer still arrives.
-delete process.env.LUVUS_STUB_UNSETTLED;
+delete process.env.TTY7_STUB_UNSETTLED;
 await new Promise((resolve) => setTimeout(resolve, 2500));
 check(
 	"a read that gave up leaves the notice to deliver the answer",
@@ -769,7 +902,7 @@ check(
 console.log("\nwaiting that is satisfied");
 await deliverQueued();
 notices.length = 0;
-process.env.LUVUS_STUB_UNSETTLED = "1";
+process.env.TTY7_STUB_UNSETTLED = "1";
 const blocked = await tools.delegate.execute(
 	"verify-wait-block",
 	{ agent: "fixture-bare", task: "say the thing", wait: false },
@@ -781,7 +914,7 @@ const blockedName = blocked.content[0].text.match(/fixture-bare-[0-9a-f]{6}/)?.[
 // The wait is satisfied by the settle itself, not by a number: the hold is released while
 // the read is blocked, and the read returns the moment the child ends.
 setTimeout(() => {
-	delete process.env.LUVUS_STUB_UNSETTLED;
+	delete process.env.TTY7_STUB_UNSETTLED;
 }, 1000);
 const blockedRead = await tools.subagent_status.execute(
 	"verify-wait-block-read",
@@ -790,7 +923,7 @@ const blockedRead = await tools.subagent_status.execute(
 	undefined,
 	ctx,
 );
-delete process.env.LUVUS_STUB_UNSETTLED;
+delete process.env.TTY7_STUB_UNSETTLED;
 check(
 	"waiting on a delegation returns its answer the moment it is over",
 	/\bdone\b/.test(blockedRead.content[0].text) && blockedRead.content[0].text.includes("STUB_ANSWER"),
@@ -848,7 +981,7 @@ check(
 console.log("\nstatus tool (the pi-task shape: pull, no bash)");
 // The list needs a live row, and a row stays live only while its watcher holds a wait
 // that never returns: this child is started with the stub reporting an unsettled wait.
-process.env.LUVUS_STUB_UNSETTLED = "1";
+process.env.TTY7_STUB_UNSETTLED = "1";
 await tools.delegate.execute(
 	"verify-status-live",
 	{ agent: "fixture-bare", task: "say the thing", wait: false },
@@ -921,12 +1054,12 @@ check(
 	/working/.test(liveRead.content[0].text) && !liveRead.content[0].text.includes("STUB_ANSWER"),
 	liveRead.content[0].text,
 );
-process.env.LUVUS_STUB_UNSETTLED = "";
+process.env.TTY7_STUB_UNSETTLED = "";
 
 console.log("\ngone pane and transient errors");
 // A closed pane is not a timeout: nothing will ever report for it, so the delegation
 // has to end now instead of counting down the whole window.
-process.env.LUVUS_STUB_GONE = "1";
+process.env.TTY7_STUB_GONE = "1";
 const gone = await tools.delegate.execute("verify-gone", { agent: "fixture-bare", task: "go away" }, undefined, undefined, ctx);
 check(
 	"a closed pane ends the delegation instead of counting down",
@@ -965,7 +1098,7 @@ check(
 	notices.some((notice) => noticeText(notice).includes("its pane was closed before it finished")),
 	JSON.stringify(notices.map((notice) => noticeText(notice))),
 );
-process.env.LUVUS_STUB_GONE = "";
+process.env.TTY7_STUB_GONE = "";
 // A turn that ended on an upstream error leaves a live session behind: the parent has
 // to be told it can steer instead of delegating again.
 const erroredLogStart = readFileSync(STUB_LOG, "utf-8").length;
@@ -1011,7 +1144,7 @@ const writeAnotherTurn = (name, answer) =>
 const nameIn = (result) => /fixture-bare-[0-9a-f]{6}/.exec(result.content[0].text)?.[0];
 
 // A window a real child would have, shortened so the check need not wait ten seconds.
-process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS = "2500";
+process.env.PI_SUBAGENT_STATE_CONFIRM_MS = "2500";
 const watched = [
 	{ log: "verify-retried", task: "ERRORED_TASK", answer: "STUB_ANSWER_AFTER_RETRY" },
 	{ log: "verify-continued", task: "say the thing", answer: "STUB_ANSWER_CONTINUED" },
@@ -1034,7 +1167,7 @@ const windowLog = readFileSync(STUB_LOG, "utf-8").slice(windowsLog);
 check(
 	"a child that starts working again is waited for, not recorded as finished",
 	// Two waits per delegation: the one that reported the end, and the one after it resumed.
-	windowLog.split("\n").filter((line) => line.startsWith("wait agent-status")).length === 4 &&
+	windowLog.split("\n").filter((line) => /^wait \d+ /.test(line)).length === 4 &&
 		windowLog.split("pane close").length - 1 === 2,
 	windowLog.replace(/\n/g, " | "),
 );
@@ -1079,7 +1212,12 @@ check(
 		notices.every((notice) => !noticeText(notice).includes("(error")),
 	notices.map((notice) => noticeText(notice)).join(" || "),
 );
-process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS = "0";
+process.env.PI_SUBAGENT_STATE_CONFIRM_MS = "0";
+// A wait that can run out must do it in seconds here, not in fifteen minutes.
+process.env.PI_SUBAGENT_WAIT_SECONDS = "3";
+// The handover window is fifteen seconds in production; here it must not be.
+process.env.PI_SUBAGENT_CONFIRM_SECONDS = "3";
+process.env.PI_SUBAGENT_READY_SECONDS = "5";
 
 // An interrupted turn that had already written its answer keeps that answer: the
 // provider's "Operation aborted" line must not outrank what the turn produced.
@@ -1111,15 +1249,13 @@ const plan = await tools.delegate.execute(
 );
 const planText = plan.content[0].text;
 check("dry_run reports the resolved argv", planText.includes("argv:    pi ") && planText.includes("--no-skills"), planText);
-// The child is told to load this extension by path, and that path has to be the entry Pi
-// loaded — not whichever file happens to compute it. A wrong path here is silent: the child
-// starts without a reporter, so its pane never reports `done` and every blocking wait runs
-// to its full timeout, with nothing in the transcript to say why.
-const extensionArg = /--extension (\S+)/.exec(planText)?.[1];
+// Nothing of this extension is passed to the child: it is a plain `pi` in a pane, and tty7's
+// own hook is what reports it. A plan that pointed at this file would be loading a second copy
+// of the delegation tools into every subagent.
 check(
-	"the child is pointed at the entry file that exists",
-	extensionArg !== undefined && existsSync(extensionArg) && extensionArg.endsWith("luvus-subagent.ts"),
-	String(extensionArg),
+	"the child is a plain pi, with no extension of ours loaded into it",
+	!planText.includes("--extension") && !planText.includes("--subagent-child"),
+	planText,
 );
 check(
 	"dry_run starts nothing",
@@ -1127,79 +1263,72 @@ check(
 	readFileSync(STUB_LOG, "utf-8").slice(logBefore),
 );
 
+// A steer addresses a delegation by name; tty7 resolves that name to a pane, because the
+// launch pins the session id and the report carries it back.
+const steerMark = readFileSync(STUB_LOG, "utf-8").length;
+process.env.TTY7_STUB_UNSETTLED = "1";
+const liveRun = await tools.delegate.execute(
+	"verify-steer-live",
+	{ agent: "fixture-bare", task: "stay put", wait: false },
+	undefined,
+	undefined,
+	ctx,
+);
+const liveName = /fixture-bare-[0-9a-f]{6}/.exec(liveRun.content[0].text)?.[0];
 const steered = await tools.steer.execute(
 	"verify-steer",
-	{ sessionName: "fixture-bare-deadbe", message: "go left", interrupt: true },
+	{ sessionName: liveName, message: "go left", interrupt: true },
 	undefined,
 	undefined,
 	ctx,
 );
-const steerLog = readFileSync(STUB_LOG, "utf-8").slice(logBefore).trim().split("\n");
-check("steer reports what it did", steered.content[0].text.includes("Interrupted, then"), steered.content[0].text);
+const steerLog = readFileSync(STUB_LOG, "utf-8").slice(steerMark).trim().split("\n");
+process.env.TTY7_STUB_UNSETTLED = "";
+const escAt = steerLog.findIndex((line) => /^send \d+ --key esc$/.test(line));
+// The launch pastes the task too, so the steer's paste is the first one *after* Esc.
+const pasteAt = steerLog.findIndex((line, index) => index > escAt && /^send \d+ --from-file /.test(line));
 check(
-	"steer checks identity, interrupts, then prompts, in that order",
-	steerLog[0] === "agent read fixture-bare-deadbe" &&
-		steerLog[1] === "agent keys fixture-bare-deadbe esc" &&
-		steerLog[2] === "agent prompt fixture-bare-deadbe go left --terminal-id deadbeefdeadbeefdeadbeefdeadbeef" &&
-		steerLog[3] === "agent keys fixture-bare-deadbe enter" &&
-		// The identity check is the read, not a separate lookup: a status lookup here is what
-		// the reference implementation warns against when a child is already working.
-		!steerLog.some((line) => line.startsWith("agent get ")),
+	"steer presses Esc first, then pastes the message, then submits it",
+	escAt >= 0 && pasteAt > escAt && steerLog.some((line) => /^send \d+ --key enter$/.test(line)),
 	steerLog.join(" | "),
 );
-// A steer has no launch reply to read, so a refused paste is its own answer: nothing was
-// sent, and saying so is better than reporting a pickup that cannot be confirmed.
-process.env.LUVUS_STUB_GONE = "1";
+check(
+	"steer reports what it did",
+	steered.content[0].text.startsWith("Interrupted, then") && steered.content[0].text.includes(liveName),
+	steered.content[0].text,
+);
+const unknownSteer = await tools.steer.execute(
+	"verify-steer-unknown",
+	{ sessionName: "fixture-bare-deadbe", message: "go left" },
+	undefined,
+	undefined,
+	ctx,
+);
+check(
+	"a steer of a name tty7 has no pane for sends nothing",
+	unknownSteer.isError === true && unknownSteer.content[0].text.includes("tty7 has no pane running"),
+	unknownSteer.content[0].text,
+);
+// A pane that went away refuses the paste the way a real one does, and the refusal says
+// nothing was sent instead of reporting a message nobody received.
+const panesFile = join(SESSION_DIR, "panes.json");
+const livePanes = JSON.parse(readFileSync(panesFile, "utf-8"));
+for (const entry of Object.values(livePanes)) entry.live = false;
+writeFileSync(panesFile, JSON.stringify(livePanes));
 const refusedSteer = await tools.steer.execute(
 	"verify-steer-refused",
-	{ sessionName: "fixture-bare-deadbe", message: "go right" },
+	{ sessionName: liveName, message: "go left" },
 	undefined,
 	undefined,
 	ctx,
 );
-delete process.env.LUVUS_STUB_GONE;
+for (const entry of Object.values(livePanes)) entry.live = true;
+writeFileSync(panesFile, JSON.stringify(livePanes));
 check(
-	"a steer the host refused says nothing was sent, and which refusal it was",
-	refusedSteer.content[0].text.includes("nothing was sent") &&
-		refusedSteer.content[0].text.includes("(not_found)"),
+	"a steer a gone pane refuses says nothing was sent, and which refusal it was",
+	refusedSteer.content[0].text.includes("nothing was sent") && refusedSteer.content[0].text.includes("(1)"),
 	refusedSteer.content[0].text,
 );
-
-// The pane id is an integer the host hands out again after a close, so a steer checks the
-// terminal behind the name before typing into it: the same name on a different terminal is
-// somebody else's pane, and the message would have gone there. The host checks the same id
-// again with `--terminal-id`, but the check has to come first — pressing Esc into a stranger
-// is already a change to their terminal.
-const fencedMark = readFileSync(STUB_LOG, "utf-8").length;
-await tools.delegate.execute(
-	"verify-fenced",
-	{ agent: "fixture-bare", task: "FENCED_TASK" },
-	undefined,
-	undefined,
-	ctx,
-);
-const fencedName = /agent start (fixture-bare-[0-9a-f]{6})/
-	.exec(readFileSync(STUB_LOG, "utf-8").slice(fencedMark))?.[1];
-// The first steer is what records the terminal this delegation was seen in.
-await tools.steer.execute("verify-fenced-first", { sessionName: fencedName, message: "go left" }, undefined, undefined, ctx);
-writeFileSync(join(SESSION_DIR, `${fencedName}.terminal`), "feedfacefeedfacefeedfacefeedface");
-const reusedLog = readFileSync(STUB_LOG, "utf-8").length;
-const reused = await tools.steer.execute(
-	"verify-fenced-reused",
-	{ sessionName: fencedName, message: "go up", interrupt: true },
-	undefined,
-	undefined,
-	ctx,
-);
-check(
-	"a steer onto a pane that changed hands sends nothing, and says why",
-	reused.isError === true &&
-		reused.content[0].text.includes("different terminal now") &&
-		!readFileSync(STUB_LOG, "utf-8").slice(reusedLog).includes("agent prompt") &&
-		!readFileSync(STUB_LOG, "utf-8").slice(reusedLog).includes("agent keys"),
-	reused.content[0].text,
-);
-writeFileSync(join(SESSION_DIR, `${fencedName}.terminal`), "deadbeefdeadbeefdeadbeefdeadbeef");
 
 const left = readdirSync(PROMPT_DIR).filter((name) => !before.has(name));
 check("no prompt file is left by any path", left.length === 0, left.join(", "));
@@ -1257,7 +1386,7 @@ check(
 
 console.log("\nresume");
 // The check below needs a running delegation, so start one the stub keeps unsettled.
-process.env.LUVUS_STUB_UNSETTLED = "1";
+process.env.TTY7_STUB_UNSETTLED = "1";
 await tools.delegate.execute(
 	"verify-resume-live",
 	{ agent: "fixture-bare", task: "say the thing", wait: false },
@@ -1284,7 +1413,7 @@ check(
 );
 check(
 	"the resumed child is launched on its own session file",
-	readFileSync(STUB_LOG, "utf-8").includes("-- --session /"),
+	/'--session' '\//.test(readFileSync(STUB_LOG, "utf-8")),
 	readFileSync(STUB_LOG, "utf-8").trim().split("\n").at(-1),
 );
 // A caller that does not want to resume says so with false: that is the shape a model
@@ -1356,7 +1485,7 @@ await new Promise((resolve) => setTimeout(resolve, 1200));
 const replayLines = readFileSync(STUB_LOG, "utf-8").slice(replayLog).trim().split("\n");
 check(
 	"a replayed delegation that is still running gets a watcher again",
-	replayLines.some((line) => line.startsWith("wait agent-status")),
+	replayLines.some((line) => /^wait \d+ /.test(line)),
 	replayLines.slice(0, 4).join(" | "),
 );
 console.log("\norphan sweep");
@@ -1422,52 +1551,6 @@ writeFileSync(childFile("late-child"), "{}\n");
 utimesSync(childFile("late-child"), longAgo, longAgo);
 await tools.delegate.execute("verify-sweep-throttled", { agent: "fixture-bare", task: "say the thing", wait: false }, undefined, undefined, ctx);
 check("a second launch in the same hour does not rescan", existsSync(childFile("late-child")));
-
-console.log("\nchild state reporter");
-process.env.LUVUS_ENV = "1";
-process.env.LUVUS_PANE_ID = "77";
-process.env.LUVUS_SOCKET_PATH = "/tmp/luvus-verify.sock";
-extension.default(pi);
-const reporterLogStart = readFileSync(STUB_LOG, "utf-8").length;
-// A child session fires the same handlers, so this context needs `getBranch` too: the
-// parent's replay runs on it and reads the branch it is given.
-const sessionCtx = {
-	mode: "tui",
-	isIdle: () => true,
-	sessionManager: { getSessionId: () => "child-session", getEntries: () => [], getBranch: () => [] },
-};
-// Several handlers can share one event name (the reporter and the parent both
-// register session_shutdown), so fire every handler the extension registered.
-const fire = async (event, ctx = sessionCtx) => {
-	for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
-	await new Promise((resolve) => setTimeout(resolve, 50));
-};
-await fire("session_start");
-await fire("agent_start");
-await fire("agent_settled");
-// The reference integration's guard: a settlement that left the session busy is not the
-// end of a turn, so it must not publish one.
-await fire("agent_settled", { ...sessionCtx, isIdle: () => false });
-await fire("ui_prompt_start");
-await fire("ui_prompt_end");
-await fire("session_shutdown");
-const reporterLog = readFileSync(STUB_LOG, "utf-8").slice(reporterLogStart);
-// This pane's reports only: the reporter was installed once before, for the pane the
-// earlier sections ran with, and its reports sit in the same log.
-const reportedStates = [...reporterLog.matchAll(/agent report 77 .*?--status (\w+)/g)].map((match) => match[1]);
-check("the reporter announces idle when its session starts", reportedStates[0] === "idle", reportedStates.join(","));
-check(
-	"the reporter reports the turn as working, and its end as done once",
-	// One settlement reported `done`; the one that left the session busy reported nothing.
-	reportedStates.slice(0, 3).join(",") === "idle,working,done",
-	reportedStates.join(","),
-);
-check(
-	"a blocked dialog outranks the turn, and the state it rests in is idle, not done",
-	reportedStates.slice(3).join(",") === "blocked,idle",
-	reportedStates.join(","),
-);
-check("the reporter releases its lease on shutdown", /agent release 77/.test(reporterLog), reporterLog);
 
 console.log(
 	`\n${failures.length === 0 ? "PASS" : `FAIL (${failures.length})`}: ${checks - failures.length}/${checks} checks` +

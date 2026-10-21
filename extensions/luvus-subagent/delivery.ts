@@ -22,6 +22,7 @@ import { rmSync } from "node:fs";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { childLastWriteAt, readChildResult, type ChildResult } from "./child-session.ts";
+import { terminalRecordAt } from "./child-session.ts";
 import { START_POLL_MS, WAIT_FLOOR_MS, closePane, paneIsGone, paneState, waitForSettle, type SettleOutcome } from "./tty7.ts";
 import { COLLAPSED_LINES, COMPLETION_OUTPUT_CAP, capCompletion, endedOf, outcomeLine, settledState, shownResult } from "./outcome.ts";
 import { alreadyReported, delegations, markReported, settleDelegation } from "./registry.ts";
@@ -138,7 +139,8 @@ const QUIESCENCE_WINDOW_MS = 10_000;
  * window on every delegation in it would be testing this window instead of what it asked about.
  */
 function quiescenceMs(): number {
-	const configured = process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS;
+	const configured =
+		process.env.PI_SUBAGENT_STATE_CONFIRM_MS ?? process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS;
 	if (configured === undefined) return QUIESCENCE_WINDOW_MS;
 	const window = Number(configured);
 	return Number.isFinite(window) && window >= 0 ? window : QUIESCENCE_WINDOW_MS;
@@ -195,6 +197,12 @@ export type SettleWatch = {
 	pi: ExtensionAPI;
 	pane: string;
 	sessionId: string;
+	/**
+	 * The transcript record the watcher counts an ending from — the task's own line, when the
+	 * caller that handed it over knows it. Without it the watcher starts from the last ending
+	 * it can see, which is right for a child that had not picked the task up yet.
+	 */
+	after?: number;
 	agentName: string;
 	promptFile: string | undefined;
 	isStale: () => boolean;
@@ -202,6 +210,9 @@ export type SettleWatch = {
 
 export async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 	const { pi, pane, sessionId, agentName, promptFile, isStale } = watch;
+	// One cursor, moved forward only: a child that ends a turn, goes back to work and ends
+	// again must be settled by the ending that came after the watching, not by the first one.
+	let cursor = watch.after ?? terminalRecordAt(sessionId) ?? -1;
 	// The registry owns the start time, so the notice and the widget agree.
 	const startedAt = delegations.get(sessionId)?.startedAt ?? Date.now();
 	let outcome: SettleOutcome = "timeout";
@@ -217,7 +228,9 @@ export async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 			// is still running. The floor stops a wait that fails at once from spinning.
 			for (;;) {
 				const cycleStart = Date.now();
-				outcome = await waitForSettle(pi, pane);
+				// Measured from the ending this cycle already knew about: a child that went back to
+				// work has to end *again* to be settled again.
+				outcome = await waitForSettle(pi, pane, { sessionId, after: cursor });
 				if (outcome !== "timeout" || isStale()) break;
 				const spent = Date.now() - cycleStart;
 				// A wait that failed at once is not the child's end: wait out the floor and watch
@@ -232,6 +245,9 @@ export async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 			const verdict = await awaitQuiescence(pi, sessionId, pane, isStale);
 			if (verdict === "stale") return;
 			if (verdict !== "continued") break;
+			// The cursor stays where it was: whatever ended the turn this window rejected is
+			// still "an ending", so the next cycle recognizes the newer one at once instead of
+			// blocking for an ending that has already been written.
 		}
 		// A closed pane is a delegation that ended without finishing; a wait that ran out
 		// leaves a child that is still working, which is not a failure and not an end.

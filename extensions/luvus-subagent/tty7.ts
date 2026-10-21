@@ -18,14 +18,26 @@
  *   "not yet" and "gone" stay different answers from "broken".
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { terminalRecordAt } from "./child-session.ts";
 
 // ── The CLI ────────────────────────────────────────────────────────────────
 
 /** tty7 is on PATH inside a tty7 pane; the override exists for tests and odd installs. */
 export const tty7Binary = (): string => process.env.PI_TTY7_BIN?.trim() || "tty7";
 
-/** How long a blocking delegation waits for the child before giving up. */
-export const WAIT_SECONDS = 900;
+/** A positive number of seconds from an override, or the default. */
+function seconds(value: string | undefined, fallback: number): number {
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * How long a blocking delegation waits for the child before giving up.
+ *
+ * Overridable because the checks must not spend fifteen minutes on a wait that is meant to
+ * run out; nothing else needs the knob.
+ */
+export const WAIT_SECONDS = seconds(process.env.PI_SUBAGENT_WAIT_SECONDS, 900);
 
 /**
  * The shortest gap between two watcher cycles.
@@ -52,13 +64,13 @@ export const START_POLL_MS = 1_000;
 export const STDERR_TAIL_CHARS = 200;
 
 /** How long a fresh child gets to write the task into its transcript. Measured: a second. */
-export const START_CONFIRM_SECONDS = 15;
+export const START_CONFIRM_SECONDS = seconds(process.env.PI_SUBAGENT_CONFIRM_SECONDS, 15);
 
 /** How long a steer to a busy child waits for the host to see it picked the message up. */
-export const STEER_CONFIRM_SECONDS = 15;
+export const STEER_CONFIRM_SECONDS = seconds(process.env.PI_SUBAGENT_CONFIRM_SECONDS, 15);
 
 /** How long the child gets to come up — a split, a command line and Pi's own boot. */
-export const READY_TIMEOUT_SECONDS = 90;
+export const READY_TIMEOUT_SECONDS = seconds(process.env.PI_SUBAGENT_READY_SECONDS, 90);
 
 /** A pane probe is one fast read; a server that hangs must not stall a delegation. */
 export const PANE_PROBE_TIMEOUT_MS = 10_000;
@@ -210,6 +222,27 @@ export async function paneAgent(pi: ExtensionAPI, pane: string): Promise<AgentVi
 	return undefined;
 }
 
+/**
+ * The pane a session id is running in, or `undefined` when tty7 does not list one.
+ *
+ * The launch pins the child's session id (`--session-id`), and tty7 reports it back, so the
+ * name a delegation is known by resolves to its pane without this extension keeping a map.
+ * That is what lets a steer reach a delegation from a session that did not start it.
+ */
+export async function paneForSession(pi: ExtensionAPI, sessionId: string): Promise<string | undefined> {
+	const reply = await tryTty7(pi, ["agents", "--json"], PANE_PROBE_TIMEOUT_MS).catch(() => undefined);
+	if (reply === undefined || reply.code !== 0) return undefined;
+	const agents = reply.result.agents;
+	if (!Array.isArray(agents)) return undefined;
+	for (const entry of agents) {
+		const state = objectField(entry, "state");
+		if (state?.session_id !== sessionId) continue;
+		const pane = numberField(entry, "pane_id");
+		if (pane !== undefined) return String(pane);
+	}
+	return undefined;
+}
+
 /** The state a pane reports right now, or `undefined` when it cannot be read. */
 export async function paneState(pi: ExtensionAPI, pane: string): Promise<string | undefined> {
 	return (await paneAgent(pi, pane))?.status;
@@ -353,6 +386,16 @@ export type SettleOutcome = "settled" | "timeout" | "gone";
 export type Arm = { status: string; turns: number | undefined };
 
 /**
+ * The record a settled turn is measured from: the task's own line in the child's transcript.
+ *
+ * This is the stronger of the two signals and the one a delegation has whenever it knows the
+ * task text. A terminal record *after* `after` is this task's ending, whatever the pane was
+ * doing before it — which is what makes it immune to both a `done` that predates the task and
+ * a turn that ended before anybody started watching.
+ */
+export type TurnTarget = { sessionId: string; after: number };
+
+/**
  * Wait for the child's next finished turn.
  *
  * `armed` is the turn counter as it stood when the child was last handed work. The wait is
@@ -366,11 +409,11 @@ export type Arm = { status: string; turns: number | undefined };
 export async function waitForSettle(
 	pi: ExtensionAPI,
 	pane: string,
-	arm?: Arm,
+	target?: TurnTarget,
 ): Promise<SettleOutcome> {
 	// The pane as it stands when watching begins. `armed?.turns === undefined` covers both "no
 	// agent yet" and "an agent with no counter": either way a `done` seen later is new.
-	const armed = arm ?? (await paneAgent(pi, pane));
+	const armed = target === undefined ? await paneAgent(pi, pane) : undefined;
 	const deadline = Date.now() + WAIT_SECONDS * 1000;
 	for (;;) {
 		const remaining = Math.max(1, Math.round((deadline - Date.now()) / 1000));
@@ -383,6 +426,18 @@ export async function waitForSettle(
 		// `1` is the pane dying under the wait; anything else that is not a clean answer is
 		// decided by asking the pane below.
 		if (reply.code === 1) return "gone";
+		// With a task record, the transcript decides and the pane only says when to look.
+		if (target !== undefined) {
+			const ended = terminalRecordAt(target.sessionId);
+			if (ended !== undefined && ended > target.after) return "settled";
+			if (await paneIsGone(pi, pane)) return "gone";
+			if (Date.now() >= deadline) return "timeout";
+			const spentInTranscript = Date.now() - cycleStart;
+			if (spentInTranscript < WAIT_FLOOR_MS) {
+				await new Promise((resolve) => setTimeout(resolve, WAIT_FLOOR_MS - spentInTranscript));
+			}
+			continue;
+		}
 		const view = await paneAgent(pi, pane);
 		if (view === undefined) {
 			// No agent is not the same as no pane: a child that exited left its shell behind,

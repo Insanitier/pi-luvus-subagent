@@ -13,12 +13,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TASK_MARK_IN_PANE_CHARS, readSessionRecords, sessionFileFor, taskInTranscript } from "./child-session.ts";
+import { TASK_MARK_IN_PANE_CHARS, readSessionRecords, sessionFileFor, taskRecordAt } from "./child-session.ts";
 import { PROMPT_FILE_MODE } from "./env.ts";
 import { START_POLL_MS, Tty7Error, pressKey, readPane, typeText } from "./tty7.ts";
 /** How a handover ended: the child wrote the task down, or it did not, or nothing was sent. */
 export type Handover =
-	| { state: "taken" }
+	| { state: "taken"; record: number }
 	| { state: "unsent"; code: number | undefined }
 	| { state: "queued"; presses: number; unsentInComposer: boolean };
 
@@ -53,6 +53,7 @@ function sessionRecordCount(sessionName: string): number {
  */
 export async function submitAndConfirm(
 	pi: ExtensionAPI,
+	pane: string,
 	sessionName: string,
 	task: string,
 	seconds: number,
@@ -68,8 +69,8 @@ export async function submitAndConfirm(
 	writeFileSync(file, task, { encoding: "utf-8", mode: PROMPT_FILE_MODE });
 	try {
 		// Paste, then submit: a long paste leaves the text sitting in the editor on its own.
-		await typeText(pi, sessionName, file);
-		await pressKey(pi, sessionName, "enter");
+		await typeText(pi, pane, file);
+		await pressKey(pi, pane, "enter");
 	} catch (error) {
 		// A pane that went away mid-hand-over refuses the paste; the caller asks whether it
 		// is gone and reports that instead of a task that was never sent. The code rides along
@@ -82,16 +83,17 @@ export async function submitAndConfirm(
 	const deadline = Date.now() + seconds * 1000;
 	let presses = 1;
 	while (Date.now() < deadline) {
-		if (taskInTranscript(sessionName, task, before)) return { state: "taken" };
+		const record = taskRecordAt(sessionName, task, before);
+		if (record !== undefined) return { state: "taken", record };
 		// Still missing, so the paste is sitting there unsent and Enter is the step that did
 		// not land — a child that was still starting swallows one, and pressing again costs
 		// nothing while submitting is the only thing left to do.
 		await new Promise((resolve) => setTimeout(resolve, START_POLL_MS * 3));
 		if (Date.now() >= deadline) break;
-		await pressKey(pi, sessionName, "enter").catch(() => undefined);
+		await pressKey(pi, pane, "enter").catch(() => undefined);
 		presses += 1;
 	}
-	return { state: "queued", presses, unsentInComposer: await taskSitsUnsent(pi, sessionName, task) };
+	return { state: "queued", presses, unsentInComposer: await taskSitsUnsent(pi, pane, task) };
 }
 
 /**
@@ -102,8 +104,8 @@ export async function submitAndConfirm(
  * this, that case is indistinguishable from a child that read the task and ignored it,
  * and the two call for opposite next moves.
  */
-export async function taskSitsUnsent(pi: ExtensionAPI, sessionName: string, task: string): Promise<boolean> {
-	const read = await readPane(pi, sessionName);
+export async function taskSitsUnsent(pi: ExtensionAPI, pane: string, task: string): Promise<boolean> {
+	const read = await readPane(pi, pane);
 	if (read === undefined) return false;
 	// Enough of the task to be unmistakable; the pane wraps and indents long lines.
 	return read.text.includes(task.slice(0, TASK_MARK_IN_PANE_CHARS));
