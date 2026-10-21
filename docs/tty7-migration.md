@@ -56,6 +56,29 @@
 | **缺的是客户端** | 该协议的客户端就是 `tty7` CLI，Windows 侧有、WSL 侧不存在 |
 | 版本不一致（实测） | WSL server 自报 **26.9.4**；`~/Downloads/Programs/tty7-26.10.1-nightly.202610202101-windows-x86_64-setup.exe` ⇒ 两侧不同版本，CLI 必须对齐 **server（26.9.4）** |
 
+### 1.2 两台 server 的实测对账（回答"能不能用 Windows 侧 CLI"）
+
+| | Windows 侧 | WSL 侧 |
+| --- | --- | --- |
+| server | `tty7-app.exe` 自带 daemon：pid 20020、**panes: 0**、`control_version 12`、`protocol_version 6`、`build 26.10.1-nightly.202610202101`、TCP `control.port` 52253 | `tty7-server-c12p6 --daemon`：unix `control.sock`，`machine.json` 记着 **pane 3**（~/projects/Soil_pe）与 **pane 4**（~/projects/misc = 本会话）；pane 环境自报 `TTY7=26.9.4` |
+| CLI | `D:\Software\tty7\tty7.exe`（console PE32+，**不在 PATH**） | **不存在** |
+| CLI 能看到什么 | `machine ls --json` → `{"machines":[]}`；`status --json` → `panes: 0` ⇒ **看不到也连不到 WSL 的 pane** | — |
+| 通道 | app 通过 `tty7-server --stdio[--serve\|--bridge]` 桥到 WSL（app 独占的通道，不是可路由的 machine；unix socket 也不是 Windows 进程能拨的） | daemon 的 `control.sock` 就是给 CLI 用的 |
+
+**CLI 自己的帮助原文**（`tty7.exe --help`）：
+
+> "One name, three artifacts: this CLI, the tty7 GUI (tty7-app), and tty7-server."
+> "The GUI and this CLI are both clients of the server on each machine — neither needs the other to be running."
+> "**An agent reaches the server through this binary, not through a wire protocol of its own.** Inside a tty7 shell, `$TTY7_CONFIG_DIR` points at the server, and `$TTY7_PANE` / `$TTY7_WS` let the address-taking verbs run with no address given."
+
+⇒ 官方设计就是"每台机器一个 server，agent 用同机 CLI 连它"。我们的 agent 在 WSL ⇒ WSL 侧必须有一个 `tty7` CLI 二进制。**这不是再装一个终端**：daemon 已由 app 起好、窗口照旧显示，缺的只是客户端那半个。
+
+**版本差（实测）**：WSL server **26.9.4** vs Windows app **26.10.1-nightly**；installer 的
+`server/tty7-server-linux-x86_64-musl` 也是 26.10.1，且**只带 server，不带 CLI**
+（实测 `agents --json` 仍被拒）。所以 Linux CLI 需另取；并且给 26.9.4 的 daemon 配客户端要留意
+`control_version`/`protocol_version` 拒绝。**升级 WSL daemon 会杀掉它所有的 pane（含本会话）**，
+只能在用户选定的时刻做。
+
 **措辞修正**：不是"没有通道"，而是 **"pi→tty7 的状态上报通道有；pi→tty7 的控制通道缺客户端"**。两者不能互相替代：`agent-hook` 只能喂状态，不能开 pane / 发键 / 读屏 / 等状态。
 
 **为什么要紧**：现有扩展的一切都通过 CLI 驱动底座（`luvus.ts` 全部 266 行）。tty7 在文档里提供的驱动面同样是 **CLI**（`send/wait/capture/agents/procs/pane`），没有 socket 协议、没有 SDK、没有"上报状态"的 API（§6）。**CLI 不可达 ⇒ 迁移无从谈起。** 必须先解决 P0（§7）。
