@@ -1,0 +1,312 @@
+# luvus → tty7 迁移对照表
+
+> 目的：在写第一行迁移代码之前，把**我们现有每一处实现**与 **tty7 已有的能力**逐条对齐，明确
+> "直接用它的 / 我们保留的 / 需要新设计的 / 明确没有的"，避免重造轮子。
+>
+> 本文是**留档**：上下文被压缩后应从这里恢复，不要重新调研。
+>
+> 判定用词：
+> - **采用**：tty7 已有等价能力，我们不再自己写。
+> - **改用**：tty7 的能力比我们的更好，按它的换掉我们。
+> - **保留**：与终端底座无关的协议逻辑，代码不动。
+> - **新增**：tty7 没有、必须我们自己设计。
+> - **丢弃**：换底座后这段代码应删除。
+>
+> 取证：两个 explorer 并行取样（代码面清点 / tty7 全量文档 38 页 + 仓库 skill 三文件）+
+> 本机实测（见 §1）。凡标 **推断** 的，是没有原文/实测支撑的判断，必须由 §7 的探针结论替换。
+
+---
+
+## 0. 摘要
+
+| 面 | 结论 |
+| --- | --- |
+| 现有代码 | 2879 行（主文件 631 + 模块 2248），外部依赖面 = **10 条 luvus 子命令**，全部集中在 `luvus.ts` 与 `state-reporter.ts` 两处 |
+| 逐条判定 | 采用 5 · 改用 11 · 保留 34 · 新增 4 · 丢弃 12（详见 §4） |
+| 最大的删减 | `state-reporter.ts`（164 行整个删除，由 tty7 的 Pi hooks 取代）、`agent explain`/authority 证据层、`terminal_id` 身份栅栏、`WAIT_FLOOR_MS` 自旋兜底 |
+| 最大的收益 | 状态由**声明**（hooks）而非推断；`--changed` + `stale` + `since_ms` 取代我们手写的"level vs event"补丁；`no-agent`/`exit`/退出码 0·124·1 把"没开始/死了/还没好/好了"四件事分开 |
+| 唯一的阻塞项 | **本机没有 tty7 CLI**（只有 daemon），扩展与 tty7 之间的调用通道不存在 ⇒ §1、§7-P0 |
+| 结论 | 方案本身成立且是升级；但**先解决 P0，再写代码**。在 P0 之前不动任何实现。 |
+
+---
+
+## 1. 本机实测（2026-10-18，本机 = Windows + WSL）
+
+| 实测项 | 结果 | 命令/证据 |
+| --- | --- | --- |
+| tty7 是否在跑 | **是** | `pgrep -af tty7` → `tty7-server-c12p6 --daemon`、`--stdio`、`--stdio --pane` |
+| daemon 二进制 | `~/.local/share/tty7/bin/tty7-server-c12p6`（12.1 MB） | 同上 |
+| daemon 配置/套接字 | `~/.config/tty7/{control.sock,daemon.sock,daemon.lock,machine.json}` | `ls -la ~/.config/tty7` |
+| **`tty7` CLI** | **不存在**：不在 PATH，`~/.local/share/tty7/bin` 里只有 server 二进制；`tty7-server --help` 只接受 `--daemon/--stdio/--serve/--bridge/--control-sock/--pane` | `command -v tty7` → 空；`find` 无结果 |
+| Windows 侧 CLI | 未找到（只找到 `%LOCALAPPDATA%\Temp\tty7-wslrc-*` 的 shell 注入临时目录） | 有界 `find` |
+| 本会话的环境变量 | 有 `TTY7_SHELL_INTEGRATION`/`TTY7_ZDOTDIR`/`TTY7_RC`；**没有 `TTY7_PANE`、`TTY7_WS`** | `env | grep TTY7` |
+| 含义（推断） | 我们的 shell 是 tty7 注入过的 shell（shell integration 生效），但没有把 pane 身份导出到子进程；CLI 缺失意味着"从 pane 内部驱动 tty7"这条路现在走不通 | — |
+
+**为什么要紧**：现有扩展的一切都通过 CLI 驱动底座（`luvus.ts` 全部 266 行）。tty7 在文档里提供的驱动面同样是 **CLI**（`send/wait/capture/agents/procs/pane`），没有 socket 协议、没有 SDK、没有"上报状态"的 API（§6）。**CLI 不可达 ⇒ 迁移无从谈起。** 必须先解决 P0（§7）。
+
+候选解法（待验证，不要拍板）：
+1. 从源码构建 Linux 侧 CLI（仓库公开，文档有 Building from source 一节）；
+2. GUI 安装包可能自带 CLI，只是没放进 WSL 的 PATH（需在 Windows 侧确认安装布局）；
+3. 用 `tty7-server --stdio --serve` / `--control-sock` 直接对话（**无文档**，属协议逆向，风险高，不建议）——仅在 1、2 都失败时考虑。
+
+---
+
+## 2. 外部依赖面 ← → tty7
+
+换底座要替换的**全部**接口（10 条 luvus 子命令；全部经 `luvus.ts:83 callLuvus`，两处例外在 `state-reporter.ts`）。
+
+| # | 我们用的 luvus 命令 | 用途（§4 编号） | tty7 对应 | 判定 | 备注 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `agent start <s> --kind pi --auto --timeout 90 -- <argv>` | 1.1 | **无等价原子命令**（`run` 阻塞；`exec` 仅 skill 文档、也阻塞） | **新增** | `split`+`send` 或 detach `run`；见 §8.1 |
+| 2 | `agent prompt <t> <task> [--terminal-id]` | 2.1 2.6 7.4 | `send %P <text> --enter`（多行 `--paste`） | 采用 | `--terminal-id` 栅栏随 pane id 终身稳定而失去意义 |
+| 3 | `agent keys <t> enter\|esc` | 2.2 7.3 7.6 | `send %P --key enter\|escape` | 采用 | 键名表含 `enter/escape/tab/C-<char>/M-<char>` |
+| 4 | `wait agent-status <p> --status done --timeout 900` | 3.3 3.5 5.8 | `wait %P --until waiting,done,exit --changed --timeout N` | **改用** | 退出码 0/124/1 天然区分 达成/超时/先死；JSON 带 `status/stale/activity/message/session_id` |
+| 5 | `agent get <p>`（状态） | 3.1 1.5 1.6 | `agents --json` / `wait` 的 `exit` / `pane ls --all` | 改用 | `since_ms` + `diagnostics` 免费得到 |
+| 6 | `agent explain <p>`（authority/证据） | 3.10 2.6 | `agents --json` 的 `diagnostics` + `doctor` 的 `hooks{installed,outdated,not_installed}` + `procs` 的 `context` | **丢弃**（原能力） | 我们那套"状态是否可信"的手工证据层，被结构性回答取代 |
+| 7 | `agent read <t>` → `{text, terminal_id}` | 2.3 7.1 7.2 | `capture %P --plain --tail N` → `{pane,text,bytes}` | 采用 | `terminal_id` 没了 ⇒ 身份栅栏整体丢弃 |
+| 8 | `pane close <p>` | 1.3 1.4 5.8 | `pane close %P` | 采用 | 文档明说 pane id 终身稳定 |
+| 9 | `agent report <p> --source pi/extension --status … --ttl 300` | 9.1–9.7 | **Pi hooks**（GUI Settings→Integrations 安装） | **丢弃**（原实现） | 声明式状态的来源换成 pi 自己的 hook |
+| 10 | `agent release <p> --source pi/extension` | 9.4 | hooks 无租约概念 | 丢弃 | 无 TTL ⇒ 无"释放" |
+| — | `trash <file>`（会话文件 GC） | 6.9 | 无 | 保留 | tty7 不管我们的 session 文件 |
+
+**提而未用**：`agent prompt --strict`（README.md:42，代码未用）。
+**非 CLI 外部项**：`trash`（`sweeps.ts:123`，失败回退 `rmSync`）；`luvus` 二值定位 `LUVUS_BIN_PATH || "luvus"`（`luvus.ts:15`）——迁移后对应 `TTY7_BIN_PATH || "tty7"`。
+
+---
+
+## 3. 换底座后仍属于我们的层（协议层，一行不动）
+
+`child-session.ts`（全文件：JSONL 定位/解析/stopReason/进度/任务匹配）· `outcome.ts`（全文件）·
+`agents.ts`（除 launch argv 的转交方式）· `env.ts` · `handover.ts` 的协议部分 · `registry.ts` 的表与
+UI · `delivery.ts` 的交付规则（合并/封顶/一次性/渲染器）· `sweeps.ts` · `editor.ts` ·
+`state-reporter.ts` 的**状态映射**（事件→状态机，可复用于别处）。
+
+理由：tty7 明确**没有**"按 pane 读取结构化消息"的能力（§6-H3），所以答案提取必须还是我们读子会话
+JSONL；而"一次性交付 / 通知合并 / 注册表持久化 / resume / steer"这些是委派协议，不属于终端。
+
+---
+
+## 4. 逐条对照（编号沿用代码面清点，行号见各条）
+
+### 4.1 进程/pane 生命周期
+
+| # | 我们的实现 | 判定 | 依据 / 替换方式 |
+| --- | --- | --- | --- |
+| 1.1 | `agent start … -- <pi argv>`（`luvus.ts:121`） | **新增** | tty7 无"非阻塞 argv spawn"。两条候选：`split`+`send`（pane id 确定，但过 shell）；detach `run --keep`（argv 直传，但 pane id 靠 `agents --json` 反查，退出码无人收） |
+| 1.2 | 粘贴后按 transcript 判 taken/queued/unsent（`handover.ts:51`） | 保留 + 采用 | 保留我们的 transcript 判据（tty7 无 composer 语义）；**并采用**官方 "Prove it started"：首次 `send` 后必须 `capture --plain \| tail -3`，仍停在提示符就补 `send --enter` |
+| 1.3 | 只在 settle 后 `closePane`（`delivery.ts:281`） | 采用 | `pane close %P` |
+| 1.4 | 关窗 15s 超时、抛错吞掉（`luvus.ts:214`） | 采用 | 保留超时与吞错策略 |
+| 1.5 | `session_start` 重放 entries 重挂 watcher（`luvus.ts` + `registry.ts:300`） | 保留（外联改用） | 骨架保留；`paneIsGone` → `wait` 的 `exit` / `pane ls --all` |
+| 1.6 | 重放时 pane 已消失 → 直接 failed（`registry.ts:326`） | 改用 | `wait` 的 `status: exit` 是显式事实 |
+| 1.7 | `session_shutdown` → stale（`registry.ts:373`） | 保留 | 我们自己的会话边界 |
+| 1.8 | `session_tree` 只重放不重挂（`luvus-subagent.ts:113`） | 保留 | — |
+
+### 4.2 输入/交付
+
+| # | 我们的实现 | 判定 | 依据 / 替换方式 |
+| --- | --- | --- | --- |
+| 2.1 | `agent prompt <t> <task>`（`handover.ts:64`） | 采用 | `send %P <task> --enter`；多行用 `--paste`（bracketed paste） |
+| 2.2 | Enter 重试每 3s 至 15s，计数 presses（`handover.ts:77`） | 保留 | 官方同样要求补 `--enter`；判定可加 `procs` 的 `context.at_prompt`（**对 shell 有效，对 pi 的 TUI 无效**） |
+| 2.3 | 屏幕含任务前 32 字 → 卡在输入框（`handover.ts:100`） | 保留 | `capture --plain --tail` 提供文本；语义仍是我们的 |
+| 2.4 | transcript 前 64 字匹配 + 基线记录数（`child-session.ts:228`） | 保留 | 核心判据，tty7 无等价物 |
+| 2.5 | `Handover` 四态文案（`handover.ts:121`） | 保留 | — |
+| 2.6 | unsent/queued 分支 + `stateAuthority`（`luvus-subagent.ts:280`） | 改用 | 状态可信度改由 `diagnostics`/`doctor` 结构化回答，`stateAuthority` 丢弃 |
+| 2.7 | resume 查表（本会话名 / child session id，`luvus-subagent.ts:210`） | 保留 | — |
+| 2.8 | resume 改走 `--session <file>`（`agents.ts:231`） | 保留 | — |
+| 2.9 | 命名 `<agent>-<6hex>`（`luvus-subagent.ts:242`） | 保留 | — |
+| 2.10 | 子代理侧把 bracketed paste 逐字符喂回（`editor.ts`） | 保留（待探针 P4 复核） | tty7 `send --paste` 是否还需要这层，需实测 |
+
+### 4.3 状态与等待
+
+| # | 我们的实现 | 判定 | 依据 / 替换方式 |
+| --- | --- | --- | --- |
+| 3.1 | `agent get` 解析信封（`luvus.ts:157`） | 改用 | `agents --json`（`status`/`since_ms`/`diagnostics`） |
+| 3.2 | 只有 `not_found` 才算 gone（`luvus.ts:174`） | 改用 | `wait` 的 `exit` 状态、`pane ls --all` 的 `orphan`/`live` |
+| 3.3 | `wait agent-status … --status done`（`luvus.ts:204`） | 改用 | `wait --until waiting,done,exit --changed`；退出码 0/124/1 直接映射我们的 `settled/timeout/gone` |
+| 3.4 | `SettleOutcome = settled\|timeout\|gone`（`luvus.ts:143`） | 保留 | 语义与 tty7 退出码一一对应 |
+| 3.5 | `WAIT_FLOOR_MS` 自旋兜底（`delivery.ts:219`） | **丢弃** | `--changed` 从根上解决"陈旧 level"，floor 的动机消失 |
+| 3.6 | 静默窗口 10s，mtime 增长或 `working` → continued（`delivery.ts:133`） | 保留 + 改用输入 | 窗口仍需要（管 retry/续写：level 又变回 level）；但输入从"自己 stat 文件"改成 `since_ms`（状态持有多久是接口事实），mtime 仅作补充信号 |
+| 3.7 | `sessionStale` 由 `isStale` 传入（`delivery.ts:174`） | 保留 | — |
+| 3.8 | `subagent_status` 的 abort/timeout 只结束读者（`registry.ts:227`） | 保留 | — |
+| 3.9 | `waitExpiredNote` 给出路（`outcome.ts:60`） | 保留 | — |
+| 3.10 | `agent explain` 的 authority/证据（`luvus.ts:255`） | **丢弃** | 见 §2 第 6 行 |
+
+### 4.4 结果提取（全部保留）
+
+| # | 实现 | 判定 |
+| --- | --- | --- |
+| 4.1 | 子会话文件定位 `_<id>.jsonl` | 保留 |
+| 4.2 | `readSessionRecords` 半行 skip/give-up 双策略 | 保留 |
+| 4.3 | `stopReason ∈ {stop,endTurn,length,error,aborted}` 取最后一条 | 保留 |
+| 4.4 | error/aborted → failed，但已产出文本优先 | 保留 |
+| 4.5 | `shownResult` 不交临时答案 | 保留 |
+| 4.6 | `endedOf`/`settledState` 单一判据 | 保留 |
+| 4.7 | `readChildProgress` + `childLastWriteAt` | 保留（可补 `procs`/`capture` 作旁证，不改判据） |
+| 4.8 | `sinceLastRead`/`progressLine`/`rememberRead` | 保留 |
+
+> 交叉核对机会：`wait` 的 JSON 带 `message`（agent 自己最后一条话）与 `session_id`。**推断**：可用来对账我们读出的答案，但**不能**取代它（没有 stopReason、没有完整文本）。
+
+### 4.5 交付与通知（全部保留）
+
+5.1 一次性交付 · 5.2 已交付只指向 · 5.3 `waitingReads` 让路 · 5.4 合并+封顶 · 5.5
+`deliverAs:"steer"` · 5.6 卡片渲染 · 5.7 排队清除网 · 5.8 `deliverWhenSettled` 双循环骨架 ·
+5.9 `blockingResult`。**仅把底座调用换掉**（`waitForSettle`/`paneState`/`paneIsGone`/`closePane`）。
+
+### 4.6 注册表/持久化/UI（全部保留）
+
+6.1 entry 持久化 · 6.2 reload 恢复 · 6.3 会话边界 · 6.4 widget 行 · 6.5 `trackDelegation` ·
+6.6 `settleDelegation` · 6.7 prompt 文件清理 · 6.8 孤儿会话回收 · 6.9 `trash` 落盘 · 6.10
+`referencedSessionNames`。
+> tty7 管 pane 与 layout，**不管**我们的 session 文件；这部分没有任何东西可以交给它。
+
+### 4.7 steer 与 interrupt
+
+| # | 实现 | 判定 | 依据 |
+| --- | --- | --- | --- |
+| 7.1 | `terminal_id` 身份校验（`luvus-subagent.ts:451`） | **丢弃** | 文档："a pane keeps its id for its whole life" ⇒ 换手检测的前提消失 |
+| 7.2 | `rememberTerminal`（`registry.ts:279`） | 丢弃 | 同上 |
+| 7.3 | `interrupt=true` 先 Esc（`luvus-subagent.ts:466`） | 采用 | `send %P --key escape` |
+| 7.4 | `--terminal-id` 栅栏（`handover.ts:64`） | 丢弃 | 同上 |
+| 7.5 | `handoverText` 四态 + catch 包装 | 保留 | — |
+| 7.6 | steer 确认窗口 15s | 保留 | — |
+
+### 4.8 杂项（全部保留，除 8.9/8.10 的转交方式）
+
+8.1 dry_run · 8.2 agent 定义加载 · 8.3 系统提示目录重建 · 8.4 `/subagent-agents` · 8.5 skill 解析 ·
+8.6 模型/thinking · 8.7 session dir/提示文件 · 8.8 env 开关（新增 `TTY7_BIN_PATH`） · 8.9
+`SELF_PATH → --extension` · 8.10 子进程完整 argv。
+> 8.9/8.10 的 **argv 内容不变**，但交给 tty7 的方式变了 ⇒ 需要 **shell 引号化**（§8.1）。
+
+### 4.9 子代理侧
+
+| # | 实现 | 判定 |
+| --- | --- | --- |
+| 9.1 | 租约开关（`LUVUS_ENV`/`LUVUS_PANE_ID`/`LUVUS_SOCKET_PATH`） | 丢弃 |
+| 9.2 | `reporterState` 状态机 | 丢弃（映射逻辑可留在文档里备查） |
+| 9.3 | `agent report … --ttl 300` + 心跳 | 丢弃 |
+| 9.4 | `agent release` | 丢弃 |
+| 9.5 | `--subagent-child` 标志 + 只装 reporter 就 return | **保留**（仍用于跳过工具注册；不再装 reporter） |
+| 9.6 | 只发状态不发内容、session id 截断 | 丢弃 |
+| 9.7 | 事件源 `session_start/agent_start/agent_settled/ui_prompt_*` | 丢弃（hooks 取代） |
+
+> **整文件 `state-reporter.ts`（164 行）删除**，是本次迁移最大的净删减。
+
+### 4.10 测试设施
+
+| # | 现状 | 判定 |
+| --- | --- | --- |
+| 10.1 | 桩覆盖 10 条 luvus 命令 | **新增**：tty7 桩覆盖 `split/send/capture/agents/wait/procs/pane close/doctor` |
+| 10.2 | 桩用文件模拟状态与特殊任务名 | 保留（任务名那套照搬） |
+| 10.3 | `LUVUS_STUB_GONE/UNSETTLED` | 改用：tty7 桩用**退出码**模拟（0/124/1+`status:exit`）与 `--changed`/`stale` |
+| 10.4 | `trash` 桩 | 保留 |
+| 10.5 | 假 pi Proxy | 保留 |
+| 10.6 | 隔离与 `LUVUS_SUBAGENT_STATE_CONFIRM_MS=0` | 保留（改名 `TTY7_*`） |
+| 10.7 | 18 组 ~109 条 check | 保留：**同一份检查跑两个底座**（`--substrate luvus\|tty7`） |
+| 10.8 | 关键被锁行为（含 "the launch reply is the only status read"） | 那条检查**要重写**：它是 luvus 的性质，tty7 下换成 "prove it started" 的检查 |
+
+---
+
+## 5. tty7 已有、我们**不要**重造的东西（含出处）
+
+| 能力 | 出处 | 我们原来怎么做 |
+| --- | --- | --- |
+| `--changed`：只认等待开始后**移动进**的状态 | orchestration.md | `WAIT_FLOOR_MS` + 静默窗口补丁 |
+| `stale` 标志：回答是否可能属于上一轮 | wait JSON（orchestration.md / commands.md） | 同上 |
+| `since_ms`：状态持有多久 | agents JSON（reference.md） | 自己 `stat` 子会话文件的 mtime |
+| `no-agent` vs `idle` 的区分 | orchestration.md NOTE | 靠 `command_fallback` 猜"是不是猜的" |
+| 退出码 0/124/1 + `status: exit` | reference.md、orchestration.md | 非 0 退出码后再 `agent get` 二次确认 |
+| `diagnostics` / `doctor`（hooks installed/outdated/not_installed） | reference.md、status.md | `agent explain` 的 authority/source |
+| pane id 终身稳定（`%42`）；`@N` tab 号不稳定 | cli/overview.md | `terminal_id` 身份栅栏 |
+| `procs` 的 `context.at_prompt`/`local_pty` | reference.md | 无（我们只能读屏） |
+| `events` 流式事件（NDJSON，无字段文档） | reference.md | 1s 轮询 |
+| Pi 的 **声明式**状态（hooks） | status.md（hooks 表含 `Pi`） | 子代理侧自建租约上报（164 行） |
+| 关窗后/重启后的 session resume（`restore_agent_sessions`，replay 原始 launch flags） | sessions.md、concepts.md | 我们自己的 `resume` + `--session <file>` |
+| worktree 一条命令建好并启动 agent（`worktree new --agent --task`） | reference.md、worktrees.md | 无 |
+| 人看的通知（OSC 9/777/99、`notify_on_command_finish`） | status.md、configuration.md | **不冲突**：我们通知的是父代理，不是人 |
+
+## 6. tty7 明确**没有**、必须我们负责的
+
+| 缺什么 | 证据 | 我们怎么办 |
+| --- | --- | --- |
+| **H1** 非阻塞 argv spawn | reference.md "Not implemented yet" 只列 `ws stop`/`machine connect`；`run`/`exec` 都阻塞 | §8.1 启动握手 |
+| **H2** 外部程序上报任意状态 | 全站 grep 无 report/socket 接口；状态只来自 hooks 或进程树 | 依赖 Pi hooks；钩子不可用时降级为 transcript 信号（§7-P1） |
+| **H3** 按 pane 读结构化消息 | `capture` 只给屏幕文本；`wait` 只给最后一条 `message`+`session_id`；`events` 无字段文档 | **保留** `child-session.ts` 全文件（这是最不可替代的一块） |
+| **H4** 程序可订阅的通知通道 | 只有 `events`，无 schema | 保留我们的轮询 watcher（可选用 `events` 优化） |
+| **H5** 管我们的 session 文件 | 无 | 保留 `sweeps.ts` |
+
+## 7. tty7 与我们冲突/必须遵守的纪律
+
+- **不许 `send` 进不是自己开的 pane**、**不许关不是自己建的 pane/tab/workspace**、**不许 `server stop/restart`**、**不许 `pane close --orphans`**（SKILL.md 明写"人的扫帚，你别挥"）⇒ 我们的 sweeps 只能碰自己的 session 文件（现状正好如此 ✓）；`--orphans` **永远不调**。
+- **必须用交互模式，不许 `-p`**（print 模式无 TUI、会话即弃）⇒ 我们的 launch argv 已经是交互 pi ✓。
+- **首次 `send` 后必须"prove it started"**（`capture --plain | tail -3`，仍在提示符就补 `--enter`）⇒ 这是 §8.1 的强制步骤。
+- **结果收集优先走 git，屏幕只作诊断**（delegation.md）⇒ 见 §9 待定决策 D3。
+- **`waiting` 应尽量由我们自己值守**（在任务边界内直接答，越界才上报人）⇒ 见 §9 待定决策 D2。
+- 文档自身不一致：网站 CLI 参考 vs 仓库 skill（`exec` 只在 skill；`send`/`capture` 的 JSON 字段不同；"Settings → Integrations" vs "Settings → Agents"）⇒ **以已安装二进制为准**，P0 解决后把 `--help`/`--json` 实样抓进 §1。
+
+## 8. 需要新设计的三处
+
+### 8.1 启动握手（替代 `agent start`）
+
+目标性质（现在有、不能丢）：**父代理开始等之前，就知道"子进程起来了"**；argv 不被 shell 曲解。
+
+方案 A（推荐）：`split --v`（默认目标 `$TTY7_PANE`，子 pane 就在父旁边）→ `send %NEW '<引号化的 pi 命令>' --enter` → **prove it started**（`capture --plain --tail 3`；仍在提示符 ⇒ 补 `--enter`）→ `agents --json` 里该 pane 出现 `pi` 且带 `session_id` ⇒ 启动成功。
+需新增：argv→shell 行的引号化（含空参数 `''`）、失败态上报（"命令没跑起来 + 屏幕尾行"）、超时。
+
+方案 B：detach `tty7 run --keep --ws <WS> -- <pi argv…>`（argv 直传）→ 用 `agents --json` 的 `session_id` 反查 pane id。
+优点：无引号问题；缺点：pane id 非原子获得、退出码无人收、必须以 `--ws` 指定 workspace（会动用户的 layout 组织）。
+
+**推断**：B 的 `--keep` 语义（"leaves the pane alive as a new tab afterwards"）意味着 pane 只在命令结束后才"留存"，与我们的生命周期不吻合 ⇒ 倾向 A。**待 P3 实测。**
+
+### 8.2 状态映射（hooks → 我们的 outcome）
+
+我们只需要三个终态判据：`done`（本轮结束）/ `waiting`（等输入）/ `exit`（pane 没了）+ `no-agent`（钩子没生效的护栏）。
+需确认：pi hook 是否报告 turn 边界（`done`）、是否报告 `waiting`（权限提示/提问）、`session_id` 是否与 `--session-id` 我们钉的 id 一致（用于把 row 与 session 文件对齐）。
+
+### 8.3 静默窗口的新输入
+
+保留窗口，但改成：`agents --json` 的 `status === done && since_ms` 连续 > 窗口；辅以 `childLastWriteAt` 作为"它在写"的证据。这样窗口不再依赖我们自己造的时间基准。
+
+## 9. 待你拍板的设计决定
+
+| # | 决定 | 选项 | 我的倾向 |
+| --- | --- | --- | --- |
+| D1 | 子代理 pane 开在哪 | (a) `split` 父 pane 旁边；(b) `tty7 new` 独立 workspace | (a) 默认——我们的卖点就是"可见、可 steer"；fan-out 时可切 (b) |
+| D2 | 是否值守 `waiting` | (a) 只上报；(b) 边界内自动答，越界上报 | (b)，但先把"边界"写进 agent 定义的 frontmatter（新增字段），不在代码里硬编码 |
+| D3 | 结果交付物 | (a) 保持"子代理最后一段文本"；(b) 改为 git diff/worktree；(c) 按任务类型 | (c)：写文件类任务用 (b)，研究/审计类用 (a) |
+| D4 | 是否用 `events` 替代轮询 | (a) 继续轮询；(b) 订阅 `events` | (a) 先不动：`events` 无字段文档，风险高于收益 |
+
+## 10. 探针清单（按"能否一票否决"排序；P0 未过不动代码）
+
+| # | 问题 | 怎么测（只读） | 判定标准 | 不过怎么办 |
+| --- | --- | --- | --- | --- |
+| **P0** | **CLI 在哪、能否驱动同一个 daemon** | 在装 tty7 的机器上 `command -v tty7`、`tty7 doctor --json`、`tty7 agents --json` | 能列出本机 pane/agent，且 `doctor.server.reachable=true` | 从源码构建 CLI；仍不行 ⇒ 整个方案暂停（回到 Herdr/rmux 评估） |
+| **P1** | 我们启动的子 pi 是否触发 Pi hooks（**声明式状态是否存在**） | `split` → `send` 一条 pi 命令（带我们完整 argv）→ `agents --json` 反复读 | 出现 `agent: pi`、`status` 随轮次在 working/done 变化、带 `session_id`、无 `diagnostics` | 退回"H2 降级方案"：状态只能靠 transcript mtime + `capture`，迁移收益大打折扣（需重新评估值不值） |
+| P2 | hooks 是否覆盖 `waiting`（权限提示/提问） | 在子 pane 里让 pi 触发一次确认框/提问，读 `agents --json` | `status` 变 `waiting` | D2 只能做 (a) 只上报 |
+| P3 | 启动两条路（A/B）哪条能保住 argv 与 pane id | 各跑一次，比对 pane id 获取方式、`capture` 尾行、失败注入（故意写错命令） | A：失败能被 `capture` 立刻识别；B：pane id 可稳定反查 | 用可行的那条，并相应加检查 |
+| P4 | `send --paste` vs 逐字符：子 pi 里任务文本是否被当成 paste 块 | 两种都发，看子 pi composer 与 transcript 的 user 记录 | transcript 里的 user 文本与我们发出的逐字一致（不加 paste 标记） | 保留/去掉 `editor.ts` 的对应处理 |
+| P5 | `wait --until done --changed` 在"retry 场景"下的行为 | 子 pi 触发一次连接错误→重试，观察 `wait` 是否在第一次 `done` 就返回 | 第一次 `done` 返回（预期）⇒ 我们的窗口仍必要 | 若它自己就跳过了 retry 的 done，可考虑省掉窗口（记录并简化） |
+| P6 | `capture --plain --tail N` 的保真度（32 字 task mark 匹配） | 发一个含特殊字符/多行的任务，比对屏幕尾行 | 前 32 字能在屏幕中找到 | 调整 `TASK_MARK_IN_PANE_CHARS` 或改用 transcript 判据 |
+
+## 11. 目标架构与迁移顺序
+
+```
+                        ┌─────────────── 协议层（不动，~2000 行）───────────────┐
+delegate / subagent_status / steer │ delivery · registry · outcome · handover · child-session · sweeps
+                        └───────────────────────┬─────────────────────────────┘
+                                    Substrate 接口（现有 luvus.ts 导出面）
+                        ┌───────────────────────┴─────────────────────────────┐
+                     luvus.ts（保留，回退用）                        tty7.ts（新写）
+                                                                  + 无 state-reporter（用 hooks）
+```
+
+接口面（必须由 `tty7.ts` 实现）：`startChild` · `submitAndConfirm` 所需的 `pressKey`/`readPane` ·
+`paneState`/`paneIsGone` · `waitForSettle` · `closePane`。`stateAuthority` 删除。
+
+顺序（每步都可回退）：
+1. **P0 通过**后，把本文件 §1 换成实测结果（`--help`/`--json` 实样）。
+2. 写 `tty7.ts` + `verify.mjs` 的 tty7 桩；同一份 109 条检查用 `--substrate` 跑两遍（luvus 仍绿）。
+3. P1/P3/P4 探针跑完，补 §8 三处设计，新增检查（启动失败可识别、hooks 缺失可诊断、窗口输入换成 `since_ms`）。
+4. 默认底座切到 tty7；luvus 代码保留一个版本周期作为回退。
+5. 删除 `state-reporter.ts`、`stateAuthority`、`terminal_id` 栅栏、`WAIT_FLOOR_MS`；跑全套检查；更新 README 的设计段。
+
+**验收门槛**：同一份检查在两个底座上全绿；`npm run check` 零错误；README 的每条设计断言在新底座下仍成立（不成立的就改 README，而不是让代码悄悄违背它）。
