@@ -116,6 +116,34 @@ $ tty7 pane ls --json
 3. **§8.2 的修正**：我说的"luvus 起的子代理没有 TTY7"需要更精确——**只要子进程的 pane 是 tty7 的 pane，它就会继承 `TTY7`/`TTY7_PANE`**（本会话正是 luvus 起的，`launch_argv: ["pi"]`，仍然被正确识别）。真正决定的是**pane 从哪来**，不是谁 spawn。luvus 自己的 pane 不是 tty7 pane ⇒ 那里的子代理不报状态。
 4. 仍待测（P1 第二问）：**我们自己用完整 argv 起的子 pi**（`--session-dir … --extension … --subagent-child … --system-prompt <file>`）是否同样被认成 `Pi` 且状态随轮次变化 —— 需要在 tty7 里开一个 pane 试。
 
+### 1.4 P1 第二问实测（我们自己的完整 argv 起的子 pi）—— 2026-10-21，环境已切 tty7 原生
+
+前提：本会话已是 **tty7 原生 pane 4**（`TTY7_CONFIG_DIR`/`TTY7`/`TTY7_PANE` 全在），**Luvus 进程已不存在**（只剩二进制）⇒ 现有 `delegate` 通道实际离线。
+
+探针（全程只读 + 我们自己创建的 pane，结束已 `pane close`）：
+
+```
+tty7 split --v                      → %6
+tty7 send %6 'pi --session-dir ~/.pi/agent/subagent-sessions --session-id probe-tty7-1   --name probe-tty7-1 --extension …/luvus-subagent.ts --subagent-child --no-skills' --enter
+```
+
+| 测量 | 结果 |
+| --- | --- |
+| 是否被识别 | `{"pane_id":6,"agent":"Pi","state":{…,"session_id":"probe-tty7-1","rich":true,"turns":0,"inferred":false}}` ⇒ **认成 Pi，声明式**，`session_id` **正是我们 `--session-id` 钉的值**（可直接与我们的 registry/会话文件对齐） |
+| 状态机 | `idle` → 派活后 `working` → `done`，`turns` 随轮次递增（0 → 1 → … → 3） |
+| 我们的结果提取 | 子会话文件 `2026-10-21T09-34-07-613Z_probe-tty7-1.jsonl` 有 17 条记录，最后一条 `assistant stop=stop text="PROBE_OK"` ⇒ **`readChildResult` 原样可用** |
+| 顺带看到的 | 中间有两条 `assistant stop=error`（pi-retry 重试）⇒ 我们那个"终态要持续成立才认账"的窗口仍然必要 |
+
+**两条新发现（影响设计，必须记住）**：
+
+1. **`wait --until done --changed` 有竞态**：如果子代理的那一轮在 `wait` 开始*之前*就结束了，`--changed` 会拒绝当前这个
+   `done`，于是一直等到超时（实测阻塞 72s 被手动终止，而 `turns` 已经涨过）。
+   ⇒ 我们的 watcher **不能只靠 `--changed`**：必须在 send 前记下 `turns`，等到 "`turns` 增大 **且** `status=done`"，或 `wait` 返回后用 `turns`/`stale` 复核。
+2. **`since_ms` 在本机这个 server（26.9.4）里不存在**（JSON 里没有该字段，文档是给新版本的）
+   ⇒ §8.3 的"窗口输入改用 `since_ms`"在本机不成立，必须用 **`turns` + 子会话文件 mtime** 作为"状态是否还在延续"的证据。
+
+另外：`capture --plain --tail 18` 对 pi 的 TUI 只取到边框和状态行 ⇒ 印证 tty7 自己的建议——**结果走会话/文件，屏幕只作诊断**。
+
 **措辞修正**：不是"没有通道"，而是 **"pi→tty7 的状态上报通道有；pi→tty7 的控制通道缺客户端"**。两者不能互相替代：`agent-hook` 只能喂状态，不能开 pane / 发键 / 读屏 / 等状态。
 
 **为什么要紧**：现有扩展的一切都通过 CLI 驱动底座（`luvus.ts` 全部 266 行）。tty7 在文档里提供的驱动面同样是 **CLI**（`send/wait/capture/agents/procs/pane`），没有 socket 协议、没有 SDK、没有"上报状态"的 API（§6）。**CLI 不可达 ⇒ 迁移无从谈起。** 必须先解决 P0（§7）。
