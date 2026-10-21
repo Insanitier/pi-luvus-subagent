@@ -1,5 +1,5 @@
 /**
- * luvus-subagent — tty7-backed subagents for Pi.
+ * tty7-subagent — subagents in tty7 panes, for Pi.
  *
  * A subagent is a real `pi` process running in a tty7 pane, so it is visible,
  * interruptible, and steerable while it works. Agents are declared once in
@@ -16,24 +16,24 @@ import { join } from "node:path";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { answerAlreadyDelivered, awaitQuiescence, clearQueuedNotice, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation, wentBackToWorkNote } from "./luvus-subagent/delivery.ts";
-import { capCompletion, settledState, waitExpiredNote } from "./luvus-subagent/outcome.ts";
-import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberRead, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./luvus-subagent/registry.ts";
-import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./luvus-subagent/agents.ts";
-import { type ChildResult, readChildProgress, readChildResult, sessionFileFor, terminalRecordAt } from "./luvus-subagent/child-session.ts";
-import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, paneAgent, paneForSession, paneIsGone, pressKey, waitForSettle } from "./luvus-subagent/tty7.ts";
-import { blockingResult, dryRunReport, launchChild } from "./luvus-subagent/flow.ts";
-import { handoverText, submitAndConfirm } from "./luvus-subagent/handover.ts";
-import { DELEGATION_ENTRY } from "./luvus-subagent/env.ts";
-import { sweepExpiredPrompts, sweepOrphanSessions } from "./luvus-subagent/sweeps.ts";
+import { answerAlreadyDelivered, awaitQuiescence, clearQueuedNotice, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation, wentBackToWorkNote } from "./tty7-subagent/delivery.ts";
+import { capCompletion, settledState, waitExpiredNote } from "./tty7-subagent/outcome.ts";
+import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberRead, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./tty7-subagent/registry.ts";
+import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./tty7-subagent/agents.ts";
+import { type ChildResult, readChildProgress, readChildResult, sessionFileFor, terminalRecordAt } from "./tty7-subagent/child-session.ts";
+import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, paneAgent, paneForSession, paneIsGone, pressKey, waitForSettle } from "./tty7-subagent/tty7.ts";
+import { blockingResult, dryRunReport, launchChild } from "./tty7-subagent/flow.ts";
+import { handoverText, submitAndConfirm } from "./tty7-subagent/handover.ts";
+import { DELEGATION_ENTRY } from "./tty7-subagent/env.ts";
+import { sweepExpiredPrompts, sweepOrphanSessions } from "./tty7-subagent/sweeps.ts";
 // The pieces the checks drive by name. They live in modules now; the entry keeps the
 // names stable, because a check that reaches into a moved file is a check that has to
 // change whenever the file moves.
-export { discoverAgents, prepareLaunch, writePromptFile } from "./luvus-subagent/agents.ts";
+export { discoverAgents, prepareLaunch, writePromptFile } from "./tty7-subagent/agents.ts";
 
 // ── Extension entry ────────────────────────────────────────────────────────
 
-export default function luvusSubagent(pi: ExtensionAPI) {
+export default function tty7Subagent(pi: ExtensionAPI) {
 	// Nothing of ours runs in the child: a subagent is a plain `pi` in a tty7 pane, and
 	// tty7's own agent hook reports its status from the child's events. That is also why a
 	// subagent cannot spawn subagents — it never loads this extension, so it has no tool to
@@ -46,7 +46,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 	// A queued notice is cleared by identity when Pi starts delivering it, and by this
 	// net when it never does: a delivery discarded with Escape never starts.
 	pi.on("message_start", ({ message }) => {
-		if (message.role === "custom" && message.customType === "luvus-subagent-completion" && message.content === queuedNotice()) {
+		if (message.role === "custom" && message.customType === "tty7-subagent-completion" && message.content === queuedNotice()) {
 			clearQueuedNotice();
 		}
 	});
@@ -512,7 +512,7 @@ export default function luvusSubagent(pi: ExtensionAPI) {
 
 	/**
 	 * Let the parent read its own delegations instead of scraping tty7 through bash:
-	 * the widget is for the human, and a bash `luvus wait` is auto-backgrounded by
+	 * the widget is for the human, and a bash `tty7 wait` is auto-backgrounded by
 	 * whatever background-task extension happens to be installed.
 	 *
 	 * This is a read, and `wait` belongs here, where the reference puts it: a model-set

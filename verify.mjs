@@ -26,10 +26,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXTENSION = join(HERE, "extensions", "luvus-subagent.ts");
+const EXTENSION = join(HERE, "extensions", "tty7-subagent.ts");
 // Every temp path below — and the prompt directory the extension computes at import
 // time — must land in this run's own dir, or a test run would sweep the shared one.
-process.env.TMPDIR = mkdtempSync(join(tmpdir(), "luvus-verify-"));
+process.env.TMPDIR = mkdtempSync(join(tmpdir(), "tty7-verify-"));
 
 // ── 0. Locate the Pi SDK, so its bare imports resolve outside the Pi runtime ──
 const sdkRoot = (() => {
@@ -71,10 +71,10 @@ process.env.PI_SUBAGENT_WAIT_SECONDS = "3";
 // The handover window is fifteen seconds in production; here it must not be.
 process.env.PI_SUBAGENT_CONFIRM_SECONDS = "3";
 process.env.PI_SUBAGENT_READY_SECONDS = "5";
-const HOME = join(tmpdir(), `luvus-verify-${process.pid}`);
+const HOME = join(tmpdir(), `tty7-verify-${process.pid}`);
 const AGENT_DIR = join(HOME, ".pi", "agent");
 const SESSION_DIR = join(AGENT_DIR, "subagent-sessions");
-const PROMPT_DIR = join(tmpdir(), "luvus-subagent-prompts");
+const PROMPT_DIR = join(tmpdir(), "tty7-subagent-prompts");
 mkdirSync(join(AGENT_DIR, "agents"), { recursive: true });
 mkdirSync(SESSION_DIR, { recursive: true });
 // The prompt directory exists only once something writes to it, and the checks below
@@ -819,7 +819,7 @@ check(
 check(
 	"the detached watcher sends the completion notice",
 	notices.length === 1 &&
-		notices[0].customType === "luvus-subagent-completion" &&
+		notices[0].customType === "tty7-subagent-completion" &&
 		noticeText(notices[0]).includes("STUB_ANSWER"),
 	JSON.stringify(notices[0]?.content ?? null),
 );
@@ -962,7 +962,7 @@ check(
 );
 // The card is drawn per part: a merged notice gives each child its own header, coloured
 // by the glyph that header already carries, not one header and a wall of body text.
-const mergedCard = renderers["luvus-subagent-completion"](
+const mergedCard = renderers["tty7-subagent-completion"](
 	{
 		content: [
 			{ type: "text", text: "✓ worker-a (done, 4s, worker-a-aaaaaa)\n\nanswer one" },
@@ -1497,7 +1497,7 @@ mkdirSync(PARENT_SESSIONS, { recursive: true });
 const delegationLine = (name) =>
 	JSON.stringify({
 		type: "custom",
-		customType: "luvus-subagent-delegation",
+		customType: "tty7-subagent-delegation",
 		data: { sessionName: name, agent: "fixture-bare", task: "t", pane: "42", startedAt: 0 },
 	});
 const parentFile = join(PARENT_SESSIONS, "parent.jsonl");
@@ -1519,7 +1519,7 @@ writeFileSync(childFile("young-child"), "{}\n");
 // will not parse is exactly the doubt the scan does not resolve, so nothing is reaped —
 // including the two files the next check expects it to reap.
 const goodParent = readFileSync(parentFile, "utf-8");
-writeFileSync(parentFile, '{"type":"custom","customType":"luvus-subagent-delegation","data":{"sess\n');
+writeFileSync(parentFile, '{"type":"custom","customType":"tty7-subagent-delegation","data":{"sess\n');
 await tools.delegate.execute("verify-sweep-blind", { agent: "fixture-bare", task: "say the thing", wait: false }, undefined, undefined, ctx);
 check(
 	"a scan that could not read everything reaps nothing",

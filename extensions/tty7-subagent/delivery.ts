@@ -56,7 +56,7 @@ export function sendNotice(pi: ExtensionAPI, header: string, body: string): bool
 	if (queued) return shown === body;
 	pi.sendMessage(
 		{
-			customType: "luvus-subagent-completion",
+			customType: "tty7-subagent-completion",
 			// The answer rides along, capped; the renderer draws each part as its own
 			// header plus a few lines, so the transcript stays readable without hiding
 			// the result from the parent.
@@ -79,7 +79,7 @@ export function sendNotice(pi: ExtensionAPI, header: string, body: string): bool
  * parent. A header's glyph is its status, so a merged card colours every child right.
  */
 export function registerCompletionRenderer(pi: ExtensionAPI): void {
-	pi.registerMessageRenderer("luvus-subagent-completion", (message, { expanded, outputPad }, theme) => {
+	pi.registerMessageRenderer("tty7-subagent-completion", (message, { expanded, outputPad }, theme) => {
 		const parts =
 			typeof message.content === "string"
 				? [message.content]
@@ -139,8 +139,7 @@ const QUIESCENCE_WINDOW_MS = 10_000;
  * window on every delegation in it would be testing this window instead of what it asked about.
  */
 function quiescenceMs(): number {
-	const configured =
-		process.env.PI_SUBAGENT_STATE_CONFIRM_MS ?? process.env.LUVUS_SUBAGENT_STATE_CONFIRM_MS;
+	const configured = process.env.PI_SUBAGENT_STATE_CONFIRM_MS;
 	if (configured === undefined) return QUIESCENCE_WINDOW_MS;
 	const window = Number(configured);
 	return Number.isFinite(window) && window >= 0 ? window : QUIESCENCE_WINDOW_MS;

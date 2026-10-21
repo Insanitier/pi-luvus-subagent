@@ -40,7 +40,7 @@ export const MS_PER_DAY = 86_400_000;
  * file during startup, so a settled delegation deletes it; a launch that never
  * gets that far leaves it to `sweepExpiredPrompts`.
  */
-export const PROMPT_DIR = join(tmpdir(), "luvus-subagent-prompts");
+export const PROMPT_DIR = join(tmpdir(), "tty7-subagent-prompts");
 
 /** A prompt file holds an agent body, so it is readable by its owner alone. */
 export const PROMPT_FILE_MODE = 0o600;
@@ -69,5 +69,5 @@ export function isDirectory(path: string): boolean {
  * are the contract between a running delegation, a replay after a reload, and the sweep
  * that decides which child transcripts are still named by any surviving session.
  */
-export const DELEGATION_ENTRY = "luvus-subagent-delegation";
-export const SETTLED_ENTRY = "luvus-subagent-settled";
+export const DELEGATION_ENTRY = "tty7-subagent-delegation";
+export const SETTLED_ENTRY = "tty7-subagent-settled";

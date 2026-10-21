@@ -449,7 +449,7 @@ delegate / subagent_status / steer │ delivery · registry · outcome · handov
 
 | 项 | 结果 |
 | --- | --- |
-| 新增 | `extensions/luvus-subagent/tty7.ts`：`split/send/capture/agents/wait/pane close` + 就绪证明 + `turns`/记录游标 |
+| 新增 | `extensions/tty7-subagent/tty7.ts`：`split/send/capture/agents/wait/pane close` + 就绪证明 + `turns`/记录游标 |
 | 删除 | `luvus.ts`(266)、`state-reporter.ts`(164)、`editor.ts`(65)，以及 `SELF_PATH`/`SUBAGENT_CHILD_FLAG`/`terminal_id` 栅栏 |
 | 子进程 argv | 不再带 `--extension`/`--subagent-child`：子进程是普通 `pi`，状态由 tty7 的 hook 上报，且天然不能派子代理 |
 | 检查 | `verify.mjs` 的 luvus 桩换成 tty7 桩，**105/105 通过**；`tsc --noEmit` 干净 |

@@ -1,5 +1,5 @@
 {
-	"name": "pi-luvus-subagent",
+	"name": "pi-tty7-subagent",
 	"version": "0.1.0",
 	"description": "tty7-backed subagents for Pi: agent presets from .pi/agents, visible panes, steerable, blocking or background",
 	"keywords": [
