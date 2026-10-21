@@ -233,10 +233,10 @@ export function prepareLaunch(
 			? ["--session-dir", SESSION_DIR, "--session-id", sessionName, "--name", sessionName]
 			: ["--session", resumeFile];
 
-	// Nothing else is passed on purpose. The child is a plain `pi` in a tty7 pane: tty7's
-	// own agent hook reports its status from the child's events (`inferred: false`), so the
-	// child needs no reporter of ours, and it never loads this extension, so it cannot spawn
-	// subagents of its own.
+	// Nothing else is passed on purpose. The child is a plain `pi` in a tty7 pane: tty7's own
+	// agent hook reports its status from the child's events (`inferred: false`), so the child
+	// needs no reporter of ours. What keeps it from delegating in turn is the marker the launch
+	// line sets (`CHILD_ENV`), which the entry checks before registering anything.
 
 	if (agent.model !== undefined) args.push("--model", agent.model);
 	if (agent.thinking !== undefined) args.push("--thinking", agent.thinking);

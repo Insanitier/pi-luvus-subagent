@@ -14,7 +14,7 @@
  */
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { ChildProgress } from "./child-session.ts";
-import { DELEGATION_ENTRY, SETTLED_ENTRY } from "./env.ts";
+import { DELEGATION_ENTRIES, SETTLED_ENTRIES, SETTLED_ENTRY } from "./env.ts";
 import { paneIsGone } from "./tty7.ts";
 // ── Where a child is shown, and what the parent sees while it runs ─────────
 
@@ -284,11 +284,11 @@ export async function replayDelegations(pi: ExtensionAPI, entries: readonly Repl
 	const settled = new Map<string, SettledEntry>();
 	for (const entry of entries) {
 		if (entry.type !== "custom") continue;
-		if (entry.customType === DELEGATION_ENTRY) {
+		if (DELEGATION_ENTRIES.has(entry.customType ?? "")) {
 			const data = entry.data as DelegationEntry;
 			started.set(data.sessionName, data);
 		}
-		if (entry.customType === SETTLED_ENTRY) {
+		if (SETTLED_ENTRIES.has(entry.customType ?? "")) {
 			const data = entry.data as SettledEntry;
 			settled.set(data.sessionName, data);
 		}

@@ -27,6 +27,14 @@ import { START_POLL_MS, WAIT_FLOOR_MS, closePane, paneIsGone, paneState, waitFor
 import { COLLAPSED_LINES, COMPLETION_OUTPUT_CAP, capCompletion, endedOf, outcomeLine, settledState, shownResult } from "./outcome.ts";
 import { alreadyReported, delegations, markReported, settleDelegation } from "./registry.ts";
 /**
+ * The notice's `customType`. The legacy key is matched as well: a card written before the
+ * rename has to keep its renderer, and the queued notice has to keep its identity check, or an
+ * upgraded parent shows old results raw and can leave a queued notice unclearable.
+ */
+export const COMPLETION_TYPE = "tty7-subagent-completion";
+export const LEGACY_COMPLETION_TYPE = "luvus-subagent-completion";
+export const COMPLETION_TYPES: ReadonlySet<string> = new Set([COMPLETION_TYPE, LEGACY_COMPLETION_TYPE]);
+/**
  * Completion notices, delivered as one message.
  *
  * A notice that arrives while an earlier one is still waiting to be delivered rides
@@ -56,7 +64,7 @@ export function sendNotice(pi: ExtensionAPI, header: string, body: string): bool
 	if (queued) return shown === body;
 	pi.sendMessage(
 		{
-			customType: "tty7-subagent-completion",
+			customType: COMPLETION_TYPE,
 			// The answer rides along, capped; the renderer draws each part as its own
 			// header plus a few lines, so the transcript stays readable without hiding
 			// the result from the parent.
@@ -79,7 +87,12 @@ export function sendNotice(pi: ExtensionAPI, header: string, body: string): bool
  * parent. A header's glyph is its status, so a merged card colours every child right.
  */
 export function registerCompletionRenderer(pi: ExtensionAPI): void {
-	pi.registerMessageRenderer("tty7-subagent-completion", (message, { expanded, outputPad }, theme) => {
+	// Both keys: pre-rename cards stay readable, and an upgrade costs no transcript.
+	for (const type of COMPLETION_TYPES) registerRenderer(pi, type);
+}
+
+function registerRenderer(pi: ExtensionAPI, type: string): void {
+	pi.registerMessageRenderer(type, (message, { expanded, outputPad }, theme) => {
 		const parts =
 			typeof message.content === "string"
 				? [message.content]
@@ -209,8 +222,9 @@ export type SettleWatch = {
 
 export async function deliverWhenSettled(watch: SettleWatch): Promise<void> {
 	const { pi, pane, sessionId, agentName, promptFile, isStale } = watch;
-	// One cursor, moved forward only: a child that ends a turn, goes back to work and ends
-	// again must be settled by the ending that came after the watching, not by the first one.
+	// One cursor: armed once from the last ending the transcript already holds, and never
+	// advanced afterwards — a child that ends a turn, goes back to work and ends again must be
+	// settled by the ending that came after the watching, not by the first one.
 	let cursor = watch.after ?? terminalRecordAt(sessionId) ?? -1;
 	// The registry owns the start time, so the notice and the widget agree.
 	const startedAt = delegations.get(sessionId)?.startedAt ?? Date.now();

@@ -71,3 +71,27 @@ export function isDirectory(path: string): boolean {
  */
 export const DELEGATION_ENTRY = "tty7-subagent-delegation";
 export const SETTLED_ENTRY = "tty7-subagent-settled";
+/**
+ * The keys this extension wrote before it was renamed from `luvus-subagent`. A session file
+ * outlives a rename: the rows a parent already wrote still have to replay, and the sweep has
+ * to keep seeing which child transcripts those rows name — otherwise it collects a transcript
+ * whose conversation is still wanted, and `resume` then answers "its transcript is gone".
+ */
+export const LEGACY_DELEGATION_ENTRY = "luvus-subagent-delegation";
+export const LEGACY_SETTLED_ENTRY = "luvus-subagent-settled";
+/** Both dialects a session file may hold, so every reader matches the same set. */
+export const DELEGATION_ENTRIES: ReadonlySet<string> = new Set([DELEGATION_ENTRY, LEGACY_DELEGATION_ENTRY]);
+export const SETTLED_ENTRIES: ReadonlySet<string> = new Set([SETTLED_ENTRY, LEGACY_SETTLED_ENTRY]);
+/** Whether a raw session line names a delegation in either dialect, for line-level filters. */
+export const mentionsDelegation = (line: string): boolean => [...DELEGATION_ENTRIES].some((key) => line.includes(key));
+/**
+ * How a child is told apart from its parent, and it has to travel in the environment.
+ *
+ * Pi loads installed packages into every process it starts, so "the child never loads this
+ * extension" is not true of an installed copy: that child would come up with these tools and
+ * could delegate again, one pane per level, with no bound. The launch line sets this marker
+ * and the entry registers nothing when it is present — a child stays a plain `pi`, and the
+ * tty7 agent hook (a separate extension) still reports its status.
+ */
+export const CHILD_ENV = "PI_SUBAGENT_CHILD";
+export const CHILD_ENV_PREFIX = `${CHILD_ENV}=1`;

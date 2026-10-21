@@ -416,7 +416,7 @@ JSONL；而"一次性交付 / 通知合并 / 注册表持久化 / resume / steer
 | P5 | `wait --until done --changed` 在"retry 场景"下的行为 | 子 pi 触发一次连接错误→重试，观察 `wait` 是否在第一次 `done` 就返回 | 第一次 `done` 返回（预期）⇒ 我们的窗口仍必要 | 若它自己就跳过了 retry 的 done，可考虑省掉窗口（记录并简化） |
 | P6 | `capture --plain --tail N` 的保真度（32 字 task mark 匹配） | 发一个含特殊字符/多行的任务，比对屏幕尾行 | 前 32 字能在屏幕中找到 | 调整 `TASK_MARK_IN_PANE_CHARS` 或改用 transcript 判据 |
 
-## 11. 目标架构与迁移顺序
+## 11. 目标架构与迁移顺序（已被 §9 取代，保留作记录）
 
 ```
                         ┌─────────────── 协议层（不动，~2000 行）───────────────┐
@@ -466,6 +466,7 @@ delegate / subagent_status / steer │ delivery · registry · outcome · handov
 
 ### 9.2 仍然悬着（不在本次范围）
 
-- `tty7 doctor` 报 **Pi hooks OUTDATED**（22 个未安装）：GUI 里 **Settings → Integrations → Pi → Update**，不动 server、不杀 pane。状态上报的完整度取决于它。
-- 包名/仓库名仍是 `pi-luvus-subagent`；改名要动 `package.json`、README、keywords、仓库设置，是独立变更。
-- `PI_SUBAGENT_STATE_CONFIRM_MS` 保留了 `LUVUS_SUBAGENT_STATE_CONFIRM_MS` 作为回退读法，只有老测试环境会用到。
+- ~~`tty7 doctor` 报 Pi hooks OUTDATED~~：**假警报，已核清**。`doctor` 拿"它会启动的那个 `tty7-app`"当期望值，在 `/tmp` 里跑就报过期；磁盘上的 hook 文件按 26.10.0 源码重新渲染后逐字节相同（4074 字节，零差异），GUI 的 Settings → Integrations 也认为它是当前的 ⇒ 无需更新。
+- ~~包名/仓库名仍是 `pi-luvus-subagent`~~：**已改名**（`8688cd6`），代码、`package.json`、README、GitHub 仓库与本地路径全部换成 `pi-tty7-subagent`。
+- ~~`PI_SUBAGENT_STATE_CONFIRM_MS` 保留 `LUVUS_…` 回退读法~~：**已删除**（同一提交），只认新名。
+- 审阅查出、随后补掉的三处：①改名换了会话数据键，旧键现在通过别名表继续重放/清扫/渲染，否则升级后旧派活凭空消失、旧子转录还会被扫进回收站；②子进程的"普通 pi"改成**强制**而非假设（启动行带 `PI_SUBAGENT_CHILD=1`，入口看到就不注册任何东西——Pi 会把已安装的包加载进每个进程）；③`package-lock.json` 的身份跟着改。

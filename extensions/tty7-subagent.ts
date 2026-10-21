@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { answerAlreadyDelivered, awaitQuiescence, clearQueuedNotice, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation, wentBackToWorkNote } from "./tty7-subagent/delivery.ts";
+import { answerAlreadyDelivered, awaitQuiescence, clearQueuedNotice, COMPLETION_TYPES, deliverWhenSettled, holdDeliveryFor, queuedNotice, recordDelivery, registerCompletionRenderer, releaseDeliveryHold, teardownDelegation, wentBackToWorkNote } from "./tty7-subagent/delivery.ts";
 import { capCompletion, settledState, waitExpiredNote } from "./tty7-subagent/outcome.ts";
 import { type DelegationEntry, attachEntryApi, beginSession, countTurn, delegations, endSession, formatElapsed, progressLine, rememberRead, replayDelegations, restartTurnCount, settleDelegation, sinceLastRead, waitForDelegation } from "./tty7-subagent/registry.ts";
 import { discoverAgents, formatArgv, prepareLaunch, promptFileFor, writePromptFile } from "./tty7-subagent/agents.ts";
@@ -24,7 +24,7 @@ import { type ChildResult, readChildProgress, readChildResult, sessionFileFor, t
 import { type SettleOutcome, START_CONFIRM_SECONDS, STEER_CONFIRM_SECONDS, paneAgent, paneForSession, paneIsGone, pressKey, waitForSettle } from "./tty7-subagent/tty7.ts";
 import { blockingResult, dryRunReport, launchChild } from "./tty7-subagent/flow.ts";
 import { handoverText, submitAndConfirm } from "./tty7-subagent/handover.ts";
-import { DELEGATION_ENTRY } from "./tty7-subagent/env.ts";
+import { CHILD_ENV, DELEGATION_ENTRY } from "./tty7-subagent/env.ts";
 import { sweepExpiredPrompts, sweepOrphanSessions } from "./tty7-subagent/sweeps.ts";
 // The pieces the checks drive by name. They live in modules now; the entry keeps the
 // names stable, because a check that reaches into a moved file is a check that has to
@@ -34,10 +34,12 @@ export { discoverAgents, prepareLaunch, writePromptFile } from "./tty7-subagent/
 // ── Extension entry ────────────────────────────────────────────────────────
 
 export default function tty7Subagent(pi: ExtensionAPI) {
-	// Nothing of ours runs in the child: a subagent is a plain `pi` in a tty7 pane, and
-	// tty7's own agent hook reports its status from the child's events. That is also why a
-	// subagent cannot spawn subagents — it never loads this extension, so it has no tool to
-	// delegate with.
+	// A child is a plain `pi` in a tty7 pane, and tty7's own agent hook reports its status from
+	// the child's events — so it needs nothing from us, and in particular no tool to delegate
+	// with. That cannot be assumed from how the child was launched: Pi loads installed packages
+	// into every process, so an installed copy would load this extension into the child too. The
+	// launch line carries the marker instead, and registering nothing is the whole fence.
+	if (process.env[CHILD_ENV] === "1") return;
 
 	/** Set while this session is being torn down, so a watcher never messages a dead one. */
 	let sessionStale = false;
@@ -46,7 +48,7 @@ export default function tty7Subagent(pi: ExtensionAPI) {
 	// A queued notice is cleared by identity when Pi starts delivering it, and by this
 	// net when it never does: a delivery discarded with Escape never starts.
 	pi.on("message_start", ({ message }) => {
-		if (message.role === "custom" && message.customType === "tty7-subagent-completion" && message.content === queuedNotice()) {
+		if (message.role === "custom" && COMPLETION_TYPES.has(message.customType ?? "") && message.content === queuedNotice()) {
 			clearQueuedNotice();
 		}
 	});
@@ -290,7 +292,7 @@ export default function tty7Subagent(pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `${sessionName} could not be handed the task: the host refused the paste${
+								text: `${sessionName} could not be handed the task: the pane refused the paste${
 									started.code === undefined ? "" : ` (${started.code})`
 								} (its pane is still there), so nothing was sent and nothing is running.`,
 							},
@@ -471,10 +473,15 @@ export default function tty7Subagent(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			try {
 				// The pane is the address; the session name is what the transcript is filed under.
-				// This session's own records answer first, and tty7 is asked next: the launch pins
-				// the session id, so a name resolves to its pane even from a session that never
-				// started that delegation.
-				const pane = delegations.get(params.sessionName)?.pane ?? (await paneForSession(pi, params.sessionName));
+				// A recorded pane is a claim, not an address — pane ids are reused once a pane closes —
+				// so it is confirmed against the pane's own agent before anything is typed into it,
+				// and tty7 is asked when it does not confirm. This session's own records answer first
+				// so a delegation started here never needs the round trip.
+				const recorded = delegations.get(params.sessionName)?.pane;
+				const pane =
+					recorded !== undefined && (await paneAgent(pi, recorded))?.sessionId === params.sessionName
+						? recorded
+						: await paneForSession(pi, params.sessionName);
 				if (pane === undefined) {
 					return {
 						content: [

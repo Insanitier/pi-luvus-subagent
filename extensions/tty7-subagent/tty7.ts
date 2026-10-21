@@ -19,6 +19,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { terminalRecordAt } from "./child-session.ts";
+import { CHILD_ENV_PREFIX } from "./env.ts";
 
 // ── The CLI ────────────────────────────────────────────────────────────────
 
@@ -63,10 +64,19 @@ export const START_POLL_MS = 1_000;
 /** How much of a CLI's stderr is quoted back when its reply is unreadable. */
 export const STDERR_TAIL_CHARS = 200;
 
+/**
+ * How much of a sitting command line is enough to recognize it: a wrapped row can lose the
+ * lead, but a distinctive tail survives.
+ */
+export const SITTING_TAIL_CHARS = 64;
+
+/** How long a shell gets before a line still on its prompt counts as a swallowed Enter. */
+export const SITTING_GRACE_MS = 5_000;
+
 /** How long a fresh child gets to write the task into its transcript. Measured: a second. */
 export const START_CONFIRM_SECONDS = seconds(process.env.PI_SUBAGENT_CONFIRM_SECONDS, 15);
 
-/** How long a steer to a busy child waits for the host to see it picked the message up. */
+/** How long a steer to a busy child waits for the pane to see it picked the message up. */
 export const STEER_CONFIRM_SECONDS = seconds(process.env.PI_SUBAGENT_CONFIRM_SECONDS, 15);
 
 /** How long the child gets to come up — a split, a command line and Pi's own boot. */
@@ -317,6 +327,13 @@ export function commandLine(argv: string[]): string {
 export const piBinary = (): string => process.env.PI_SUBAGENT_PI_BIN?.trim() || "pi";
 
 /**
+ * When a line still sitting on the shell's prompt counts as a swallowed Enter: a third of the
+ * readiness budget at most, because a grace longer than the budget can never fire — the launch
+ * would give up first, which is the failure this rescue exists to avoid.
+ */
+const sittingGraceMs = (): number => Math.min(SITTING_GRACE_MS, (READY_TIMEOUT_SECONDS * 1000) / 3);
+
+/**
  * Bring up a child in a pane of its own and prove it is the one we asked for.
  *
  * Three steps, and the third is the one that matters: `split` gives a pane, `send` starts
@@ -336,7 +353,7 @@ export async function startChild(
 	if (pane === undefined) throw new Tty7Error("tty7 split: reply carried no pane", undefined);
 	const target = String(pane);
 
-	const line = `exec ${commandLine([piBinary(), ...argv])}`;
+	const line = `${CHILD_ENV_PREFIX} exec ${commandLine([piBinary(), ...argv])}`;
 	await callTty7(pi, ["send", target, line, "--enter"], KEYSTROKE_TIMEOUT_MS);
 
 	const startedAt = Date.now();
@@ -355,10 +372,13 @@ export async function startChild(
 		}
 		// The swallowed-Enter check: half a second of grace, then the command still on the
 		// prompt line means the carriage return was eaten and it is the one thing to resend.
-		if (!reEntered && Date.now() - startedAt > 5_000) {
+		if (!reEntered && Date.now() - startedAt > sittingGraceMs()) {
 			const read = await readPane(pi, target);
-			const lines = (read?.text ?? "").split("\n").map((part) => part.trim());
-			const sitting = lines.some((part) => part.endsWith(line) || part === line);
+			// A command wider than the terminal wraps across rows, so the rows are joined back
+			// together before they are compared: the break is the terminal's, not the line's. The
+			// shell's prompt leads the first row, hence a substring test rather than equality.
+			const joined = (read?.text ?? "").split("\n").map((part) => part.trim()).join("");
+			const sitting = joined.includes(line) || joined.includes(line.slice(-SITTING_TAIL_CHARS));
 			if (sitting && view === undefined) {
 				reEntered = true;
 				await callTty7(pi, ["send", target, "--enter"], KEYSTROKE_TIMEOUT_MS);

@@ -155,6 +155,9 @@ if (argv[0] === "send") {
 	}
 	const rest = argv.slice(2);
 	const key = rest.includes("--key") ? rest[rest.indexOf("--key") + 1] : undefined;
+	// A bare --enter is the same key as --key enter: the rescue re-sends the carriage return
+	// that way, and a stub that only knew the long form could not model that path.
+	const enters = key === "enter" || rest.includes("--enter");
 	const fromFile = rest.includes("--from-file") ? rest[rest.indexOf("--from-file") + 1] : undefined;
 	// A launch: the pane's shell starts the child, so the pane gains an agent whose session id
 	// is the one the argv pinned — that id is what the extension proves readiness with.
@@ -182,7 +185,7 @@ if (argv[0] === "send") {
 	}
 	// Enter with nothing typed is either the lost carriage return (a command sitting on the
 	// prompt) or the key that submits a paste — never both.
-	if (key === "enter") {
+	if (enters) {
 		const sitting = existsSync(file(pane, "sitting")) ? readFileSync(file(pane, "sitting"), "utf-8") : "";
 		if (sitting !== "") {
 			writeFileSync(file(pane, "entered"), "1");
@@ -208,12 +211,17 @@ if (argv[0] === "send") {
 		out({});
 	}
 	if (fromFile !== undefined) {
+		// A pane that refuses the paste is its own answer, distinct from a pane that is gone.
+		if (process.env.TTY7_STUB_REFUSE_PASTE === "1") {
+			process.stderr.write("paste refused\\n");
+			process.exit(1);
+		}
 		// Pasting is not submitting: the text lands in the child's input box, and the pane's
 		// agent learns nothing until an Enter arrives.
 		writeFileSync(file(pane, "pending"), readFileSync(fromFile, "utf-8"));
 		out({});
 	}
-	if (key === "enter") {
+	if (enters) {
 		const pending = existsSync(file(pane, "pending")) ? readFileSync(file(pane, "pending"), "utf-8") : "NEVER_PICKED";
 		const pressesFile = file(pane, "presses");
 		const count = (existsSync(pressesFile) ? Number(readFileSync(pressesFile, "utf-8")) : 0) + 1;
@@ -298,8 +306,12 @@ if (argv[0] === "capture") {
 	if (gone) { process.stderr.write("pane not found\\n"); process.exit(1); }
 	const pending = existsSync(file(pane, "pending")) ? readFileSync(file(pane, "pending"), "utf-8") : "";
 	const sitting = existsSync(file(pane, "sitting")) ? readFileSync(file(pane, "sitting"), "utf-8") : "";
-	if (sitting !== "") process.stdout.write("~/proj $ " + sitting + "\\n");
-	else if (pending !== "") process.stdout.write("\u276f " + pending + "\\n");
+	if (sitting !== "") {
+		// A command wider than the terminal wraps, and a capture shows the rows the terminal
+		// painted — so TTY7_STUB_WRAP splits the sitting line where a wrap would.
+		const shown = process.env.TTY7_STUB_WRAP === "1" ? sitting.slice(0, 60) + "\\n" + sitting.slice(60) : sitting;
+		process.stdout.write("~/proj $ " + shown + "\\n");
+	} else if (pending !== "") process.stdout.write("\u276f " + pending + "\\n");
 	else process.stdout.write("~/proj $\\n");
 	process.exit(0);
 }
@@ -459,6 +471,31 @@ extension.default(pi);
 
 console.log("module");
 check("loads and registers both tools", typeof tools.delegate?.execute === "function" && typeof tools.steer?.execute === "function");
+// Pi loads installed packages into every process, so "the child never loads this extension"
+// is only true when it was started with `-e`. The launch line marks the child instead, and a
+// marked process must come up with nothing of ours — that is the fence against a subagent
+// that can delegate again, one pane per level.
+const childTools = {};
+let childRegistrations = 0;
+const childPi = new Proxy(
+	{
+		exec,
+		registerTool: (definition) => (childTools[definition.name] = definition),
+		registerMessageRenderer: () => (childRegistrations += 1),
+		on: () => (childRegistrations += 1),
+		sendMessage: () => (childRegistrations += 1),
+		appendEntry: () => (childRegistrations += 1),
+	},
+	{ get: (target, key) => (key in target ? target[key] : noop) },
+);
+process.env.PI_SUBAGENT_CHILD = "1";
+extension.default(childPi);
+delete process.env.PI_SUBAGENT_CHILD;
+check(
+	"a child marked on its launch line registers nothing at all",
+	Object.keys(childTools).length === 0 && childRegistrations === 0,
+	`tools=${Object.keys(childTools).join(",")} registrations=${childRegistrations}`,
+);
 
 console.log("\nagent discovery and argv");
 const agents = extension.discoverAgents(HOME).map((agent) => agent.name);
@@ -528,7 +565,7 @@ const firstPaste = callLog.findIndex((line) => /^send \d+ --from-file /.test(lin
 check(
 	"a launch is a pane and the pinned session id, and readiness is that id",
 	callLog[0] === "split --vertical --json" &&
-		/^send \d+ exec /.test(callLog[1]) &&
+		/^send \d+ PI_SUBAGENT_CHILD=1 exec /.test(callLog[1]) &&
 		callLog[1].includes("'--session-id'") &&
 		firstPaste > 1,
 	callLog.join(" | "),
@@ -767,6 +804,42 @@ check(
 	stubborn.isError !== true && stubborn.content[0].text.includes("STUB_ANSWER"),
 	stubborn.content[0].text.slice(0, 200),
 );
+// The same failure modeled on the launch line itself: the command sits on the shell's prompt
+// and the carriage return never arrives. Nothing has started, so pressing again is the whole
+// fix — and it has to happen while the line is still sitting there.
+process.env.TTY7_STUB_SWALLOW = "1";
+const swallowedLaunch = await tools.delegate.execute(
+	"verify-swallow",
+	{ agent: "fixture-bare", task: "say the thing" },
+	undefined,
+	undefined,
+	ctx,
+);
+delete process.env.TTY7_STUB_SWALLOW;
+check(
+	"a launch whose Enter was swallowed is pressed again",
+	swallowedLaunch.isError !== true && swallowedLaunch.content[0].text.includes("STUB_ANSWER"),
+	swallowedLaunch.content[0].text.slice(0, 200),
+);
+// A launch line wider than the terminal wraps, and a capture shows the rows the terminal
+// painted. The recognition joins them back, or the rescue it exists for never fires and a
+// swallowed Enter costs the whole readiness timeout instead.
+process.env.TTY7_STUB_SWALLOW = "1";
+process.env.TTY7_STUB_WRAP = "1";
+const wrappedLaunch = await tools.delegate.execute(
+	"verify-swallow-wrapped",
+	{ agent: "fixture-full", task: "say the thing" },
+	undefined,
+	undefined,
+	ctx,
+);
+delete process.env.TTY7_STUB_SWALLOW;
+delete process.env.TTY7_STUB_WRAP;
+check(
+	"a wrapped launch line still reads as sitting on the prompt",
+	wrappedLaunch.isError !== true && wrappedLaunch.content[0].text.includes("STUB_ANSWER"),
+	wrappedLaunch.content[0].text.slice(0, 240),
+);
 // A pane that closed is a real failure, and the row the widget colours has to come from
 // one: an unconfirmed start is no longer recorded as a failure.
 process.env.TTY7_STUB_GONE = "1";
@@ -977,6 +1050,13 @@ check(
 	"a merged card gives each child its own header, coloured by its own glyph",
 	drawn.includes("‹success›✓ worker-a") && drawn.includes("‹error›✗ worker-b"),
 	drawn.slice(0, 240),
+);
+// A card written before the rename has to keep its renderer: an upgrade must not turn old
+// results into raw text in the transcript.
+check(
+	"a card written before the rename is still drawn as a card",
+	typeof renderers["luvus-subagent-completion"] === "function",
+	Object.keys(renderers).join(", "),
 );
 console.log("\nstatus tool (the pi-task shape: pull, no bash)");
 // The list needs a live row, and a row stays live only while its watcher holds a wait
@@ -1309,12 +1389,35 @@ check(
 	unknownSteer.isError === true && unknownSteer.content[0].text.includes("tty7 has no pane running"),
 	unknownSteer.content[0].text,
 );
-// A pane that went away refuses the paste the way a real one does, and the refusal says
-// nothing was sent instead of reporting a message nobody received.
+// A recorded pane is a claim, not an address: pane ids are reused once a pane closes, so the
+// pane a delegation remembers is typed into only while tty7 still reports it running that
+// session. A pane now owned by another session gets nothing.
 const panesFile = join(SESSION_DIR, "panes.json");
 const livePanes = JSON.parse(readFileSync(panesFile, "utf-8"));
-for (const entry of Object.values(livePanes)) entry.live = false;
+const remembered = Object.values(livePanes).find((entry) => entry.name === liveName);
+remembered.name = "someone-else";
 writeFileSync(panesFile, JSON.stringify(livePanes));
+const reusedMark = readFileSync(STUB_LOG, "utf-8").length;
+const reusedSteer = await tools.steer.execute(
+	"verify-steer-reused",
+	{ sessionName: liveName, message: "go left" },
+	undefined,
+	undefined,
+	ctx,
+);
+const reusedLog = readFileSync(STUB_LOG, "utf-8").slice(reusedMark);
+remembered.name = liveName;
+writeFileSync(panesFile, JSON.stringify(livePanes));
+check(
+	"a recorded pane now running another session is not typed into",
+	reusedSteer.isError === true &&
+		reusedSteer.content[0].text.includes("tty7 has no pane running") &&
+		!/^send \d+ --/m.test(reusedLog),
+	`${reusedSteer.content[0].text} | ${reusedLog.trim()}`,
+);
+// A pane that is still listed and still refuses the paste is its own answer: nothing was
+// sent, and the refusal says which one it was rather than reporting a message nobody got.
+process.env.TTY7_STUB_REFUSE_PASTE = "1";
 const refusedSteer = await tools.steer.execute(
 	"verify-steer-refused",
 	{ sessionName: liveName, message: "go left" },
@@ -1322,10 +1425,9 @@ const refusedSteer = await tools.steer.execute(
 	undefined,
 	ctx,
 );
-for (const entry of Object.values(livePanes)) entry.live = true;
-writeFileSync(panesFile, JSON.stringify(livePanes));
+delete process.env.TTY7_STUB_REFUSE_PASTE;
 check(
-	"a steer a gone pane refuses says nothing was sent, and which refusal it was",
+	"a pane that refuses the paste says nothing was sent, and which refusal it was",
 	refusedSteer.content[0].text.includes("nothing was sent") && refusedSteer.content[0].text.includes("(1)"),
 	refusedSteer.content[0].text,
 );
@@ -1333,8 +1435,6 @@ check(
 const left = readdirSync(PROMPT_DIR).filter((name) => !before.has(name));
 check("no prompt file is left by any path", left.length === 0, left.join(", "));
 
-// The reporter is the child-side half of this extension: it runs only when Luvus
-// hands the process a pane. Drive it through the real event handlers.
 console.log("\ndelegation prompt");
 // The parent can only delegate to agents it is told about, so the catalogue is
 // rebuilt every turn into its own system-prompt section. The shared `fire` helper
@@ -1500,15 +1600,24 @@ const delegationLine = (name) =>
 		customType: "tty7-subagent-delegation",
 		data: { sessionName: name, agent: "fixture-bare", task: "t", pane: "42", startedAt: 0 },
 	});
+// The keys were renamed once. A session file written before that still names its children,
+// and the sweep has to keep reading both dialects — a name it misses deletes a transcript
+// whose conversation is still wanted.
+const legacyDelegationLine = (name) =>
+	JSON.stringify({
+		type: "custom",
+		customType: "luvus-subagent-delegation",
+		data: { sessionName: name, agent: "fixture-bare", task: "t", pane: "42", startedAt: 0 },
+	});
 const parentFile = join(PARENT_SESSIONS, "parent.jsonl");
 // A fork copies the entries it forked from, so a child can be named by a session that
 // did not launch it — and both files can outlive the delegation.
-writeFileSync(parentFile, `${delegationLine("kept-child")}\n`);
+writeFileSync(parentFile, `${delegationLine("kept-child")}\n${legacyDelegationLine("legacy-kept-child")}\n`);
 writeFileSync(join(PARENT_SESSIONS, "fork.jsonl"), `${delegationLine("forked-child")}\n`);
 
 const childFile = (name) => join(SESSION_DIR, `1970-01-01T00-00-00-000Z_${name}.jsonl`);
 const longAgo = new Date(0);
-for (const name of ["kept-child", "forked-child", "orphan-child", "orphan-unlink-child"]) {
+for (const name of ["kept-child", "legacy-kept-child", "forked-child", "orphan-child", "orphan-unlink-child"]) {
 	writeFileSync(childFile(name), "{}\n");
 	utimesSync(childFile(name), longAgo, longAgo);
 }
@@ -1536,6 +1645,11 @@ check(
 	existsSync(childFile("kept-child")) && !trashLog.includes("kept-child"),
 	trashLog,
 );
+check(
+	"a child named only by a session written before the rename is kept",
+	existsSync(childFile("legacy-kept-child")) && !trashLog.includes("legacy-kept-child"),
+	trashLog,
+);
 check("a child only a forked session names is kept", existsSync(childFile("forked-child")), trashLog);
 check("a child too young to judge is kept", existsSync(childFile("young-child")));
 check("a child nothing names goes to the trash", trashLog.includes("orphan-child") && !existsSync(childFile("orphan-child")), trashLog);
@@ -1551,6 +1665,24 @@ writeFileSync(childFile("late-child"), "{}\n");
 utimesSync(childFile("late-child"), longAgo, longAgo);
 await tools.delegate.execute("verify-sweep-throttled", { agent: "fixture-bare", task: "say the thing", wait: false }, undefined, undefined, ctx);
 check("a second launch in the same hour does not rescan", existsSync(childFile("late-child")));
+console.log("\npre-rename sessions");
+// The keys were renamed once. A parent session written before that has to replay, or an
+// upgrade silently forgets every delegation it ever had, and a delegation whose pane is still
+// alive never gets its watcher back.
+entries.push({
+	type: "custom",
+	customType: "luvus-subagent-delegation",
+	data: { sessionName: "legacy-row", agent: "fixture-bare", task: "t", pane: "42", startedAt: 0 },
+});
+entries.push({ type: "custom", customType: "luvus-subagent-settled", data: { sessionName: "legacy-row", state: "done", endedAt: 1 } });
+for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: "resume" }, ctx);
+for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+const legacyStatus = await tools.subagent_status.execute("verify-legacy-replay", {}, undefined, undefined, ctx);
+check(
+	"a delegation written before the rename still replays",
+	legacyStatus.content[0].text.includes("legacy-row"),
+	legacyStatus.content[0].text,
+);
 
 console.log(
 	`\n${failures.length === 0 ? "PASS" : `FAIL (${failures.length})`}: ${checks - failures.length}/${checks} checks` +

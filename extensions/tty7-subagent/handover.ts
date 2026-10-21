@@ -44,7 +44,7 @@ function sessionRecordCount(sessionName: string): number {
  * is the baseline, and the confirmation is the user line the child writes when it picks
  * the task up.
  *
- * A handover the host refused sent nothing at all, and is its own answer. A launch reply
+ * A handover the pane refused sent nothing at all, and is its own answer. A launch reply
  * that reported the child as working is *not* one: measured live, `agent start` answered
  * `status: "working"` for a child that was still drawing its banner and had not taken a
  * single key — the pane's state says nothing about whether this text arrived, which is
@@ -125,7 +125,7 @@ export async function taskSitsUnsent(pi: ExtensionAPI, pane: string, task: strin
 export function handoverText(verdict: Handover, target: string, verb: string): string {
 	if (verdict.state === "taken") return `${verb} ${target}, and it is working.`;
 	if (verdict.state === "unsent") {
-		return `${verb} ${target} — nothing was sent: the host refused the message${
+		return `${verb} ${target} — nothing was sent: the pane refused the message${
 			verdict.code === undefined ? "" : ` (${verdict.code})`
 		}.`;
 	}

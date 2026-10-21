@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { readSessionRecords } from "./child-session.ts";
-import { DELEGATION_ENTRY, MS_PER_DAY, PROMPT_DIR, PROMPT_RETENTION_DAYS, SESSION_DIR, isDirectory, sessionRoot } from "./env.ts";
+import { DELEGATION_ENTRIES, MS_PER_DAY, PROMPT_DIR, PROMPT_RETENTION_DAYS, SESSION_DIR, isDirectory, mentionsDelegation, sessionRoot } from "./env.ts";
 /**
  * Drop prompt files past their window.
  *
@@ -96,12 +96,12 @@ function referencedSessionNames(): Set<string> | undefined {
 			// it might be the one naming a child, and a name missed deletes a transcript for
 			// nothing.
 			const records = readSessionRecords(path, {
-				lineFilter: (line) => line.includes(DELEGATION_ENTRY),
+				lineFilter: mentionsDelegation,
 				onUnparseable: "give-up",
 			});
 			if (records === undefined) return undefined;
 			for (const record of records as { customType?: string; data?: { sessionName?: string } }[]) {
-				if (record.customType === DELEGATION_ENTRY && typeof record.data?.sessionName === "string") {
+				if (DELEGATION_ENTRIES.has(record.customType ?? "") && typeof record.data?.sessionName === "string") {
 					names.add(record.data.sessionName);
 				}
 			}
