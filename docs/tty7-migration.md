@@ -79,6 +79,43 @@
 `control_version`/`protocol_version` 拒绝。**升级 WSL daemon 会杀掉它所有的 pane（含本会话）**，
 只能在用户选定的时刻做。
 
+### 1.3 P0 结案 + P1 首测（均为实测，2026-10-21）
+
+**取到 Linux CLI**（GitHub nightly 发行包，只解出 CLI 一个文件，43 MB tar.gz → 8.5 MB 二进制）：
+
+```
+https://github.com/l0ng-ai/tty7/releases/download/nightly/tty7-26.10.1-nightly.202610202101-linux-x86_64.tar.gz
+→ tty7-…-linux-x86_64/tty7     # 8.5 MB，`tty7 26.10.1-nightly.202610202101`
+```
+
+**方言对账（这才是版本门槛，不是版本号）**：
+
+| | control | protocol | build |
+| --- | --- | --- | --- |
+| WSL 在跑的 server（旧） | 12 | 6 | **26.9.4** |
+| Linux CLI（新） | 12 | 6 | 26.10.1-nightly |
+
+⇒ **12/6 == 12/6**，新旧 CLI/server 可以对话。用户的判断正确：服务端旧一点本身不是问题。
+
+**实测三条（`TTY7_CONFIG_DIR=/home/ft183/.config/tty7`）**：
+
+```
+$ tty7 status --json
+{"pid":467,"panes":2,"control_version":12,"protocol_version":6,"build":"26.9.4","socket":"/home/ft183/.config/tty7/control.sock"}
+
+$ tty7 agents --json
+{"agents":[{"pane_id":4,"agent":"Pi","state":{"status":"working","session_id":"01a142d7-…","launch_argv":["pi"],"rich":true,"turns":1,"inferred":false,…}}]}
+
+$ tty7 pane ls --json
+{"panes":[{"pane":4,…,"cwd":"/home/ft183/projects/misc"},{"pane":5,…}]}
+```
+
+**结论**：
+1. **P0 关闭**：WSL 侧 CLI 可用，**连到的是同一个 daemon**（`build: 26.9.4` + 我们自己的 `control.sock`），不是新 server。**不需要重启 daemon、不需要动任何 pane。**
+2. **P1 第一问已答**：tty7 把本会话认成 `agent: "Pi"`，`inferred: false`（**声明式**，不是猜的），带 `session_id` 与 `turns`。
+3. **§8.2 的修正**：我说的"luvus 起的子代理没有 TTY7"需要更精确——**只要子进程的 pane 是 tty7 的 pane，它就会继承 `TTY7`/`TTY7_PANE`**（本会话正是 luvus 起的，`launch_argv: ["pi"]`，仍然被正确识别）。真正决定的是**pane 从哪来**，不是谁 spawn。luvus 自己的 pane 不是 tty7 pane ⇒ 那里的子代理不报状态。
+4. 仍待测（P1 第二问）：**我们自己用完整 argv 起的子 pi**（`--session-dir … --extension … --subagent-child … --system-prompt <file>`）是否同样被认成 `Pi` 且状态随轮次变化 —— 需要在 tty7 里开一个 pane 试。
+
 **措辞修正**：不是"没有通道"，而是 **"pi→tty7 的状态上报通道有；pi→tty7 的控制通道缺客户端"**。两者不能互相替代：`agent-hook` 只能喂状态，不能开 pane / 发键 / 读屏 / 等状态。
 
 **为什么要紧**：现有扩展的一切都通过 CLI 驱动底座（`luvus.ts` 全部 266 行）。tty7 在文档里提供的驱动面同样是 **CLI**（`send/wait/capture/agents/procs/pane`），没有 socket 协议、没有 SDK、没有"上报状态"的 API（§6）。**CLI 不可达 ⇒ 迁移无从谈起。** 必须先解决 P0（§7）。
