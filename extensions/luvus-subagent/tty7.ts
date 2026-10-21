@@ -157,6 +157,15 @@ export async function callTty7(
 	if (reply.code !== 0) {
 		const label = `tty7 ${args[0] ?? ""}`.trim();
 		const tail = reply.stderr.slice(-STDERR_TAIL_CHARS);
+		// A CLI that produced nothing at all did not answer — it was not run. Naming the binary
+		// and the override is the difference between "the server refused" and "you have no
+		// working `tty7` here", which are two very different afternoons.
+		if (tail.length === 0 && reply.stdout.trim().length === 0) {
+			throw new Tty7Error(
+				`${label}: could not run "${tty7Binary()}" (exit ${reply.code}) — is the tty7 CLI on PATH? Set PI_TTY7_BIN to its path.`,
+				reply.code,
+			);
+		}
 		throw new Tty7Error(`${label}: ${tail.length > 0 ? tail : `exit ${reply.code}`}`, reply.code);
 	}
 	return reply;
